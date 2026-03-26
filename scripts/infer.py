@@ -104,16 +104,12 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
     """
     ckpt = torch.load(ckpt_path, map_location=device)
 
-    if isinstance(ckpt, dict):
-        if "model_state_dict" in ckpt:
-            state_dict = ckpt["model_state_dict"]
-        elif "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-        else:
-            # 有些人直接 torch.save(model.state_dict())
-            state_dict = ckpt
+    # 你的 train.py 里保存的是 {"model": model.state_dict(), ...}
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        state_dict = ckpt["model"]
     else:
-        raise ValueError(f"Unsupported checkpoint format: {type(ckpt)}")
+        # 兜底：直接把整个 ckpt 当成 state_dict（兼容你以后改成 torch.save(model.state_dict()) 的情况）
+        state_dict = ckpt
 
     # 兼容 DataParallel 保存出来带 module. 前缀的情况
     new_state_dict = {}
