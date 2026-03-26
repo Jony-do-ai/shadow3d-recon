@@ -20,6 +20,65 @@ from shadow3d.datasets.shadow_sequence_dataset import ShadowSequenceDataset
 from shadow3d.losses.chamfer import point_recon_loss
 from shadow3d.models.shadow_point_baseline import ShadowPointBaseline
 
+import open3d as o3d
+import numpy as np
+
+
+def save_point_cloud_ply(points: torch.Tensor, ply_path: str) -> None:
+    """
+    保存点云为PLY文件
+    """
+    if isinstance(points, torch.Tensor):
+        points = points.detach().cpu().float().numpy()
+
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"Expected points shape [N, 3], got {points.shape}")
+
+    if points.shape[0] == 0:
+        print(f"⚠️  Empty point cloud, skipping {ply_path}")
+        return
+
+    # 确保目录存在
+    os.makedirs(os.path.dirname(ply_path), exist_ok=True)
+
+    # 使用Open3D保存（更可靠）
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+
+    # 可选：添加颜色（根据高度）
+    if points.shape[0] > 0:
+        z = points[:, 2]
+        z_normalized = (z - z.min()) / (z.max() - z.min() + 1e-8)
+        colors = np.zeros((len(points), 3))
+        colors[:, 0] = z_normalized  # 红色通道
+        colors[:, 2] = 1 - z_normalized  # 蓝色通道
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    success = o3d.io.write_point_cloud(ply_path, pcd)
+    if success:
+        print(f"✅ Saved point cloud to {ply_path}")
+    else:
+        print(f"❌ Failed to save point cloud to {ply_path}")
+
+
+def visualize_and_save_pcd(points, save_path, title="Point Cloud"):
+    """
+    可视化并保存点云
+    """
+    if isinstance(points, torch.Tensor):
+        points = points.detach().cpu().float().numpy()
+
+    if points.shape[0] == 0:
+        print("Empty point cloud, cannot visualize")
+        return
+
+    # 保存
+    save_point_cloud_ply(torch.from_numpy(points), save_path)
+
+    # 可选：实时可视化（会阻塞训练）
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(points)
+    # o3d.visualization.draw_geometries([pcd], window_name=title)
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -46,7 +105,7 @@ def save_checkpoint(model, optimizer, step, out_path):
     torch.save(ckpt, out_path)
 
 
-def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, global_step, log_every=10):
+def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, global_step, log_every=10, save_ply_every=5, out_dir=None):
     model.train()
     running = {
         "loss_total": 0.0,
@@ -95,6 +154,19 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
                 center=f"{avg_center:.4f}",
                 bbox=f"{avg_bbox:.4f}",
             )
+
+        # 保存第一个batch的点云用于可视化（每save_ply_every个epoch）
+        if batch_idx == 0 and out_dir and epoch_idx % save_ply_every == 0:
+            with torch.no_grad():
+                # 保存预测点云
+                pred_save_path = os.path.join(out_dir, "point_clouds", f"epoch_{epoch_idx:04d}_pred.ply")
+                save_point_cloud_ply(pred_points[0], pred_save_path)
+
+                # 保存GT点云
+                gt_save_path = os.path.join(out_dir, "point_clouds", f"epoch_{epoch_idx:04d}_gt.ply")
+                save_point_cloud_ply(points_gt[0], gt_save_path)
+
+                print(f"\n💾 Saved point clouds for epoch {epoch_idx}")
 
     num_batches = max(len(loader), 1)
     epoch_stats = {k: v / num_batches for k, v in running.items()}
@@ -182,6 +254,10 @@ def main():
     global_step = 0
     best_loss = float("inf")
 
+    # 创建点云保存目录
+    pcd_out_dir = os.path.join(out_dir, "point_clouds")
+    ensure_dir(pcd_out_dir)
+
     for epoch in range(1, num_epochs + 1):
         global_step, stats = train_one_epoch(
             model=model,
@@ -192,6 +268,8 @@ def main():
             epoch_idx=epoch,
             global_step=global_step,
             log_every=int(log_cfg.get("print_every", 10)),
+            save_ply_every=int(log_cfg.get("save_ply_every", 5)),  # 每5个epoch保存一次
+            out_dir=out_dir,
         )
 
         print(
