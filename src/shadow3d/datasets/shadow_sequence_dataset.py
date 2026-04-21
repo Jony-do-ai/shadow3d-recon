@@ -194,8 +194,8 @@ class ShadowSequenceDataset(Dataset):
     def __init__(
         self,
         root: str,
-        sequences_dir: str = "sequences",
-        frames_per_seq: int = 5,
+        sequences_dir: str = "dataset",
+        frames_per_seq: int = 10,
         image_size: Tuple[int, int] = (256, 256),
         image_key: str = "shadow_mask.png",
         num_points: int = 2048,
@@ -218,55 +218,63 @@ class ShadowSequenceDataset(Dataset):
 
     def _build_index(self) -> List[Dict]:
         samples = []
-        seq_names = sorted(
-            [d for d in os.listdir(self.sequences_root)
-             if os.path.isdir(os.path.join(self.sequences_root, d))]
-        )
 
-        for seq_name in seq_names:
-            seq_dir = os.path.join(self.sequences_root, seq_name)
+        # 1. 第一层：获取所有分类目录 (如 02747177)
+        category_ids = sorted([
+            d for d in os.listdir(self.sequences_root)
+            if os.path.isdir(os.path.join(self.sequences_root, d))
+        ])
 
-            frame_dirs = sorted(
-                [
+        for cat_id in category_ids:
+            cat_dir = os.path.join(self.sequences_root, cat_id)
+
+            # 2. 第二层：获取分类下的所有实例目录 (如 1b7d468a...)
+            instance_ids = sorted([
+                d for d in os.listdir(cat_dir)
+                if os.path.isdir(os.path.join(cat_dir, d))
+            ])
+
+            for inst_id in instance_ids:
+                seq_dir = os.path.join(cat_dir, inst_id)
+                # 为了区分不同类下的同名实例，seq_name 可以结合类名
+                seq_name = f"{cat_id}_{inst_id}"
+
+                # --- 以下逻辑基本保持不变，只需确保路径正确 ---
+                frame_dirs = sorted([
                     os.path.join(seq_dir, d)
                     for d in os.listdir(seq_dir)
                     if d.startswith("frame_") and os.path.isdir(os.path.join(seq_dir, d))
-                ]
-            )
+                ])
 
-            if len(frame_dirs) < self.frames_per_seq:
-                continue
+                if len(frame_dirs) < self.frames_per_seq:
+                    continue
 
-            frame_dirs = frame_dirs[:self.frames_per_seq]
+                frame_dirs = frame_dirs[:self.frames_per_seq]
 
-            geom_dir = os.path.join(seq_dir, "object_geometry")
-            if not os.path.isdir(geom_dir):
-                continue
+                geom_dir = os.path.join(seq_dir, "object_geometry")
+                if not os.path.isdir(geom_dir):
+                    continue
 
-            gt_path = os.path.join(geom_dir, "gt.ply")
-            if not os.path.isfile(gt_path):
-                continue
+                gt_path = os.path.join(geom_dir, "gt.ply")
+                if not os.path.isfile(gt_path):
+                    continue
 
-            ok = True
-            for frame_dir in frame_dirs:
-                image_path = os.path.join(frame_dir, self.image_key)
-                light_path = os.path.join(frame_dir, "light_info.txt")
-                if not os.path.isfile(image_path) or not os.path.isfile(light_path):
-                    ok = False
-                    break
+                # 验证帧内文件
+                ok = True
+                for frame_dir in frame_dirs:
+                    image_path = os.path.join(frame_dir, self.image_key)
+                    light_path = os.path.join(frame_dir, "light_info.txt")
+                    if not os.path.isfile(image_path) or not os.path.isfile(light_path):
+                        ok = False
+                        break
 
-            if not ok:
-                continue
-
-            samples.append(
-                {
-                    "seq_name": seq_name,
-                    "seq_dir": seq_dir,
-                    "frame_dirs": frame_dirs,
-                    "gt_path": gt_path,
-                }
-            )
-
+                if ok:
+                    samples.append({
+                        "seq_name": seq_name,
+                        "seq_dir": seq_dir,
+                        "frame_dirs": frame_dirs,
+                        "gt_path": gt_path,
+                    })
         return samples
 
     def __len__(self) -> int:

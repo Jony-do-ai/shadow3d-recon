@@ -2,8 +2,8 @@ seed: 42
 device: cuda
 data:
   root: data/train_runs
-  sequences_dir: sequences
-  frames_per_seq: 5
+  sequences_dir: dataset
+  frames_per_seq: 10
   image_size:
   - 256
   - 256

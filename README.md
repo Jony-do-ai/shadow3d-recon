@@ -2,4 +2,4 @@
 python scripts/train.py --config configs/train_default.yaml
 
 
-python scripts/infer.py --config configs/train_default.yaml --checkpoint data/train_runs/shadow_point_baseline/checkpoints/best.pt --index 0       
+python scripts/infer.py --config configs/train_default.yaml --checkpoint data/train_runs/shadow_point_baseline/checkpoints/best.pt --all

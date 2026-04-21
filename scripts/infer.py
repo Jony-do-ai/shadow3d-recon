@@ -86,8 +86,8 @@ def build_dataset_from_config(cfg: Dict[str, Any]) -> ShadowSequenceDataset:
 
     dataset = ShadowSequenceDataset(
         root=root,
-        sequences_dir=data_cfg.get("sequences_dir", "sequences"),
-        frames_per_seq=int(data_cfg.get("frames_per_seq", 5)),
+        sequences_dir=data_cfg.get("sequences_dir", "dataset"),
+        frames_per_seq=int(data_cfg.get("frames_per_seq", 10)),
         image_size=tuple(data_cfg.get("image_size", [256, 256])),
         image_key=data_cfg.get("image_key", "shadow_mask.png"),
         num_points=int(cfg["model"].get("num_points", 2048)),
@@ -158,6 +158,7 @@ def main():
     parser.add_argument("--config", type=str, required=True, help="Path to yaml config")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to epoch_xxxx.pt")
     parser.add_argument("--index", type=int, default=0, help="Dataset sample index")
+    parser.add_argument("--all", action="store_true", help="Infer all samples in dataset")
     parser.add_argument("--output_dir", type=str, default="outputs/infer", help="Where to save results")
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
     args = parser.parse_args()
@@ -170,45 +171,50 @@ def main():
     dataset = build_dataset_from_config(cfg)
     print(f"[INFO] Dataset size: {len(dataset)}")
 
-    if args.index < 0 or args.index >= len(dataset):
-        raise IndexError(f"index out of range: {args.index}, dataset size = {len(dataset)}")
-
     model = build_model_from_config(cfg, device)
     load_checkpoint(model, args.checkpoint, device)
     model.eval()
 
-    pred_points, gt_points, seq_name = run_inference(
-        model=model,
-        dataset=dataset,
-        index=args.index,
-        device=device,
-    )
+    if args.all:
+        indices = range(len(dataset))
+    else:
+        if args.index < 0 or args.index >= len(dataset):
+            raise IndexError(f"index out of range: {args.index}, dataset size = {len(dataset)}")
+        indices = [args.index]
 
-    save_dir = os.path.join(args.output_dir, seq_name)
-    ensure_dir(save_dir)
+    for idx in indices:
+        pred_points, gt_points, seq_name = run_inference(
+            model=model,
+            dataset=dataset,
+            index=idx,
+            device=device,
+        )
 
-    pred_ply_path = os.path.join(save_dir, "pred.ply")
-    gt_ply_path = os.path.join(save_dir, "gt.ply")
-    meta_json_path = os.path.join(save_dir, "meta.json")
+        save_dir = os.path.join(args.output_dir, seq_name)
+        ensure_dir(save_dir)
 
-    save_point_cloud_ply(pred_points, pred_ply_path)
-    save_point_cloud_ply(gt_points, gt_ply_path)
+        pred_ply_path = os.path.join(save_dir, "pred.ply")
+        gt_ply_path = os.path.join(save_dir, "gt.ply")
+        meta_json_path = os.path.join(save_dir, "meta.json")
 
-    meta = {
-        "seq_name": seq_name,
-        "dataset_index": args.index,
-        "checkpoint": args.checkpoint,
-        "pred_ply": pred_ply_path,
-        "gt_ply": gt_ply_path,
-    }
-    with open(meta_json_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, ensure_ascii=False)
+        save_point_cloud_ply(pred_points, pred_ply_path)
+        save_point_cloud_ply(gt_points, gt_ply_path)
 
-    print("[INFO] Inference done.")
-    print(f"[INFO] seq_name : {seq_name}")
-    print(f"[INFO] pred ply : {pred_ply_path}")
-    print(f"[INFO] gt ply   : {gt_ply_path}")
-    print(f"[INFO] meta json: {meta_json_path}")
+        meta = {
+            "seq_name": seq_name,
+            "dataset_index": idx,
+            "checkpoint": args.checkpoint,
+            "pred_ply": pred_ply_path,
+            "gt_ply": gt_ply_path,
+        }
+        with open(meta_json_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+
+        print(f"[INFO] Inference done: index={idx}, seq_name={seq_name}")
+        print(f"[INFO] pred ply : {pred_ply_path}")
+        print(f"[INFO] gt ply   : {gt_ply_path}")
+        print(f"[INFO] meta json: {meta_json_path}")
+
 
 
 if __name__ == "__main__":

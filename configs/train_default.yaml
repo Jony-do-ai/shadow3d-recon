@@ -3,8 +3,8 @@ device: "cuda"
 
 data:
   root: "data/train_runs"
-  sequences_dir: "sequences"
-  frames_per_seq: 5
+  sequences_dir: "dataset"
+  frames_per_seq: 10
   image_size: [256, 256]
   image_key: "shadow_mask.png"
   batch_size: 2

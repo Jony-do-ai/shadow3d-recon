@@ -158,12 +158,13 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
         # 保存第一个batch的点云用于可视化（每save_ply_every个epoch）
         if batch_idx == 0 and out_dir and epoch_idx % save_ply_every == 0:
             with torch.no_grad():
+                seq_name = batch["seq_name"][0]
                 # 保存预测点云
-                pred_save_path = os.path.join(out_dir, "point_clouds", f"epoch_{epoch_idx:04d}_pred.ply")
+                pred_save_path = os.path.join(out_dir, "point_clouds", f"epoch_{epoch_idx:04d}_{seq_name}_pred.ply")
                 save_point_cloud_ply(pred_points[0], pred_save_path)
 
                 # 保存GT点云
-                gt_save_path = os.path.join(out_dir, "point_clouds", f"epoch_{epoch_idx:04d}_gt.ply")
+                gt_save_path = os.path.join(out_dir, "point_clouds", f"epoch_{epoch_idx:04d}_{seq_name}_gt.ply")
                 save_point_cloud_ply(points_gt[0], gt_save_path)
 
                 print(f"\n💾 Saved point clouds for epoch {epoch_idx}")
@@ -195,8 +196,8 @@ def main():
     data_cfg = cfg["data"]
     dataset = ShadowSequenceDataset(
         root=data_cfg["root"],
-        sequences_dir=data_cfg.get("sequences_dir", "sequences"),
-        frames_per_seq=int(data_cfg.get("frames_per_seq", 5)),
+        sequences_dir=data_cfg.get("sequences_dir", "dataset"),
+        frames_per_seq=int(data_cfg.get("frames_per_seq", 10)),
         image_size=tuple(data_cfg.get("image_size", [256, 256])),
         image_key=data_cfg.get("image_key", "shadow_mask.png"),
         num_points=int(cfg["model"].get("num_points", 2048)),
@@ -211,7 +212,7 @@ def main():
         drop_last=False,
     )
 
-    print(f"[INFO] Dataset size: {len(dataset)} sequences")
+    print(f"[INFO] Dataset size: {len(dataset)} dataset")
 
     # -------------------------
     # model
