@@ -32,6 +32,7 @@ def split_dataset(
     print("-" * 80)
 
     total_moved = 0
+    skipped_categories = 0
 
     # 遍历 data/train_runs/dataset 下的一级目录，例如 A
     for category_dir in sorted(train_root.iterdir()):
@@ -39,6 +40,13 @@ def split_dataset(
             continue
 
         category_name = category_dir.name
+
+        # --- 新增功能：如果目标路径已存在该类别文件夹，则跳过 ---
+        target_category_path = test_root / category_name
+        if target_category_path.exists():
+            print(f"[SKIP CATEGORY] {category_name}: 目标目录已存在，跳过该类别")
+            skipped_categories += 1
+            continue
 
         # 当前 A 目录下的所有子文件夹，例如 B
         sample_dirs = [
@@ -97,6 +105,7 @@ def split_dataset(
         print("[DRY-RUN] 预览完成，没有实际移动任何文件夹")
     else:
         print(f"[DONE] 实际移动文件夹数量: {total_moved}")
+        print(f"[DONE] 跳过的类别总数: {skipped_categories}")
 
 def get_test_count(num_samples: int) -> int:
     """
