@@ -13,6 +13,9 @@ python scripts/split_train_test.py
 数据集统计功能：
 python scripts/count_train_test.py
 
+数据图
+python scripts/plot_train_log.py --log data/train_runs/exp_no_light/train_log.csv
+
 [📊 数据集分布统计]
 +-----------------+----------------------+--------------+--------------+
 |    文件夹名     |        中文名        |    训练集    |    测试集    |
