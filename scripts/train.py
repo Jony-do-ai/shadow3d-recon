@@ -200,7 +200,20 @@ def append_train_log(
         writer = csv.DictWriter(f, fieldnames=row.keys())
         writer.writerow(row)
 
-def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, global_step, log_every=10, save_ply_every=5, out_dir=None,use_light=True,):
+def train_one_epoch(
+        model,
+        loader,
+        optimizer,
+        device,
+        loss_cfg,
+        epoch_idx,
+        global_step,
+        log_every=10,
+        save_ply_every=5,
+        out_dir=None,
+        use_light=True,
+        use_sdf=False,
+):
     model.train()
     running = {
         "loss_total": 0.0,
@@ -230,11 +243,17 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
         light_dir = batch["light_dir"].to(device)    # [B, K, 3]
         points_gt = batch["points_gt"].to(device)    # [B, N, 3]
 
+        sdf_seq = None
+        if use_sdf:
+            if "sdf_seq" not in batch:
+                raise KeyError("use_sdf=True, but batch does not contain 'sdf_seq'. Please enable use_sdf in Dataset.")
+            sdf_seq = batch["sdf_seq"].to(device)  # [B, K, 1, H, W]
+
         # 消融实验：不使用真实光线输入
         if not use_light:
             light_dir = torch.zeros_like(light_dir)
 
-        pred_points = model(shadow_seq, light_dir)
+        pred_points = model(shadow_seq, light_dir, sdf_seq=sdf_seq)
 
         loss_dict = point_recon_loss(
             pred=pred_points,
@@ -312,6 +331,7 @@ def save_fixed_category_predictions(
     epoch_idx,
     out_dir,
     use_light=True,
+    use_sdf=False,
 ):
     """
     每隔若干 epoch，对每个类别的固定样本保存预测点云。
@@ -326,10 +346,16 @@ def save_fixed_category_predictions(
             points_gt = fixed_sample["points_gt"].unsqueeze(0).to(device)    # [1, N, 3]
             seq_name = fixed_sample["seq_name"]
 
+            sdf_seq = None
+            if use_sdf:
+                if "sdf_seq" not in fixed_sample:
+                    raise KeyError("use_sdf=True, but fixed_sample does not contain 'sdf_seq'.")
+                sdf_seq = fixed_sample["sdf_seq"].unsqueeze(0).to(device)  # [1, K, 1, H, W]
+
             if not use_light:
                 light_dir = torch.zeros_like(light_dir)
 
-            pred_points = model(shadow_seq, light_dir)
+            pred_points = model(shadow_seq, light_dir, sdf_seq=sdf_seq)
 
             # 沿用原来的 point_clouds 目录
             save_dir = os.path.join(out_dir, "point_clouds", seq_name)
@@ -359,11 +385,9 @@ def main():
     cfg = load_config(args.config)
     ablation_cfg = cfg.get("ablation", {})
     use_light = bool(ablation_cfg.get("use_light", True))
+    use_sdf = bool(ablation_cfg.get("use_sdf", False))
     print(f"[INFO] use_light = {use_light}")
-
-    ablation_cfg = cfg.get("ablation", {})
-    use_light = bool(ablation_cfg.get("use_light", True))
-    print(f"[INFO] use_light = {use_light}")
+    print(f"[INFO] use_sdf = {use_sdf}")
 
     seed = int(cfg.get("seed", 42))
     set_seed(seed)
@@ -385,6 +409,10 @@ def main():
         image_size=tuple(data_cfg.get("image_size", [256, 256])),
         image_key=data_cfg.get("image_key", "shadow_mask.png"),
         num_points=int(cfg["model"].get("num_points", 2048)),
+        use_sdf=use_sdf,
+        sdf_tau=float(data_cfg.get("sdf_tau", 20.0)),
+        shadow_is_dark=bool(data_cfg.get("shadow_is_dark", True)),
+        shadow_threshold=float(data_cfg.get("shadow_threshold", 0.5)),
     )
 
     #每10个epoch就对每个类别第一个样本做收敛的可视化观察
@@ -422,7 +450,25 @@ def main():
         light_feat_dim=int(model_cfg.get("light_feat_dim", 128)),
         fused_dim=int(model_cfg.get("fused_dim", 256)),
         num_points=int(model_cfg.get("num_points", 2048)),
+        use_sdf=use_sdf,
     ).to(device)
+
+    batch = next(iter(loader))
+    shadow_seq = batch["shadow_seq"].to(device)
+    light_dir = batch["light_dir"].to(device)
+    sdf_seq = batch.get("sdf_seq", None)
+
+    if sdf_seq is not None:
+        sdf_seq = sdf_seq.to(device)
+        print("[DEBUG] shadow_seq:", shadow_seq.shape)
+        print("[DEBUG] sdf_seq:", sdf_seq.shape)
+        print("[DEBUG] sdf min/max:", sdf_seq.min().item(), sdf_seq.max().item())
+
+    with torch.no_grad():
+        pred = model(shadow_seq, light_dir, sdf_seq=sdf_seq)
+
+    print("[DEBUG] pred:", pred.shape)
+
 
     # -------------------------
     # optim
@@ -480,6 +526,7 @@ def main():
             save_ply_every=int(log_cfg.get("save_ply_every", 5)),  # 每5个epoch保存一次
             out_dir=out_dir,
             use_light=use_light,
+            use_sdf=use_sdf,
         )
         # 每个 epoch 都计算训练耗时
         epoch_time_sec = time.time() - epoch_start_time
@@ -529,6 +576,7 @@ def main():
                 epoch_idx=epoch,
                 out_dir=out_dir,
                 use_light=use_light,
+                use_sdf=use_sdf,
             )
 
         ckpt_latest = os.path.join(out_dir, "checkpoints", "latest.pt")

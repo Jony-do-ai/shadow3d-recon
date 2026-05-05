@@ -1,0 +1,43 @@
+seed: 42
+device: "cuda"
+
+data:
+  root: "data/train_runs"
+  sequences_dir: "dataset"
+  frames_per_seq: 10
+  image_size: [256, 256]
+  image_key: "shadow_mask.png"
+  batch_size: 2
+  num_workers: 0
+  sdf_tau: 20.0
+  shadow_is_dark: false #背景黑色，阴影白色；如果是阴影黑色，背景白色就true
+  shadow_threshold: 0.5
+
+test:
+  "data/test_runs"
+
+model:
+  image_feat_dim: 256
+  light_feat_dim: 128
+  fused_dim: 256
+  num_points: 2048
+
+optim:
+  lr: 1.0e-3
+  epochs: 100
+  weight_decay: 0.0
+
+loss:
+  cd: 1.0
+  center: 0.0
+  bbox: 0.0
+  bbox_radius: 1.0
+
+ablation:
+  use_light: true
+  use_sdf: true
+
+log:
+  out_dir: data/train_runs/feature_sdf_fusion
+  print_every: 10
+  save_every_epoch: 10

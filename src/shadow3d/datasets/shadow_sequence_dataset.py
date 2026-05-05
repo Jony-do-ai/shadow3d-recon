@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from scipy.ndimage import distance_transform_edt
 
 
 def normalize_points_unit_sphere(points: np.ndarray) -> np.ndarray:
@@ -65,6 +66,65 @@ def read_image_gray(image_path: str, image_size: Tuple[int, int]) -> np.ndarray:
     arr = np.asarray(img, dtype=np.float32) / 255.0
     return arr
 
+def compute_shadow_sdf(
+    img: np.ndarray,
+    shadow_is_dark: bool = True,
+    threshold: float = 0.5,
+    tau: float = 20.0,
+) -> np.ndarray:
+    """
+    根据二维阴影 mask 计算 2D Shadow-SDF。
+
+    参数:
+        img:
+            灰度阴影图，shape [H, W]，数值范围 [0, 1]。
+            这里直接使用 read_image_gray 的输出。
+
+        shadow_is_dark:
+            如果阴影区域是黑色，背景是白色，则设为 True。
+            如果阴影区域是白色，背景是黑色，则设为 False。
+
+        threshold:
+            二值化阈值。
+
+        tau:
+            SDF 截断距离，单位是像素。
+            例如 256x256 图像建议先用 20。
+
+    返回:
+        sdf_norm:
+            shape [H, W]，范围约为 [-1, 1]。
+            阴影内部为正，阴影外部为负，边界附近接近 0。
+    """
+
+    if shadow_is_dark:
+        shadow = img < threshold
+    else:
+        shadow = img > threshold
+
+    shadow = shadow.astype(bool)
+
+    # 极端情况保护：全是阴影或全不是阴影时，SDF 无法正常定义边界
+    if shadow.all() or (~shadow).all():
+        return np.zeros_like(img, dtype=np.float32)
+
+    # 阴影内部到非阴影区域的距离
+    dist_inside = distance_transform_edt(shadow)
+
+    # 阴影外部到阴影区域的距离
+    dist_outside = distance_transform_edt(~shadow)
+
+    # 约定：阴影内部为正，外部为负
+    sdf = dist_inside - dist_outside
+
+    # 截断，避免远离边界的大距离值主导模型
+    tau = max(float(tau), 1e-6)
+    sdf = np.clip(sdf, -tau, tau)
+
+    # 归一化到 [-1, 1]
+    sdf = sdf / tau
+
+    return sdf.astype(np.float32)
 
 def _parse_ply_header(f) -> Dict:
     """
@@ -199,6 +259,10 @@ class ShadowSequenceDataset(Dataset):
         image_size: Tuple[int, int] = (256, 256),
         image_key: str = "shadow_mask.png",
         num_points: int = 2048,
+        use_sdf: bool = False,
+        sdf_tau: float = 20.0,
+        shadow_is_dark: bool = True,
+        shadow_threshold: float = 0.5,
     ):
         super().__init__()
         self.root = root
@@ -207,6 +271,11 @@ class ShadowSequenceDataset(Dataset):
         self.image_size = image_size
         self.image_key = image_key
         self.num_points = num_points
+
+        self.use_sdf = use_sdf
+        self.sdf_tau = float(sdf_tau)
+        self.shadow_is_dark = bool(shadow_is_dark)
+        self.shadow_threshold = float(shadow_threshold)
 
         if not os.path.isdir(self.sequences_root):
             raise FileNotFoundError(f"Sequences directory not found: {self.sequences_root}")
@@ -280,11 +349,11 @@ class ShadowSequenceDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-
     def __getitem__(self, index: int) -> Dict:
         sample = self.samples[index]
 
         shadow_imgs = []
+        sdf_imgs = []
         light_dirs = []
 
         for frame_dir in sample["frame_dirs"]:
@@ -292,21 +361,36 @@ class ShadowSequenceDataset(Dataset):
             light_path = os.path.join(frame_dir, "light_info.txt")
 
             img = read_image_gray(image_path, self.image_size)  # [H, W]
-            light_dir = parse_light_info(light_path)            # [3]
+            light_dir = parse_light_info(light_path)  # [3]
 
-            shadow_imgs.append(img[None, ...])   # [1, H, W]
+            shadow_imgs.append(img[None, ...])  # [1, H, W]
             light_dirs.append(light_dir)
 
-        shadow_seq = np.stack(shadow_imgs, axis=0).astype(np.float32)   # [K, 1, H, W]
-        light_dir = np.stack(light_dirs, axis=0).astype(np.float32)     # [K, 3]
+            if self.use_sdf:
+                sdf = compute_shadow_sdf(
+                    img=img,
+                    shadow_is_dark=self.shadow_is_dark,
+                    threshold=self.shadow_threshold,
+                    tau=self.sdf_tau,
+                )
+                sdf_imgs.append(sdf[None, ...])  # [1, H, W]
+
+        shadow_seq = np.stack(shadow_imgs, axis=0).astype(np.float32)  # [K, 1, H, W]
+        light_dir = np.stack(light_dirs, axis=0).astype(np.float32)  # [K, 3]
 
         points_gt = read_ply_xyz(sample["gt_path"])
         points_gt = normalize_points_unit_sphere(points_gt)
         points_gt = sample_or_pad_points(points_gt, self.num_points).astype(np.float32)
 
-        return {
-            "shadow_seq": torch.from_numpy(shadow_seq),   # [K, 1, H, W]
-            "light_dir": torch.from_numpy(light_dir),     # [K, 3]
-            "points_gt": torch.from_numpy(points_gt),     # [N, 3]
+        out = {
+            "shadow_seq": torch.from_numpy(shadow_seq),  # [K, 1, H, W]
+            "light_dir": torch.from_numpy(light_dir),  # [K, 3]
+            "points_gt": torch.from_numpy(points_gt),  # [N, 3]
             "seq_name": sample["seq_name"],
         }
+
+        if self.use_sdf:
+            sdf_seq = np.stack(sdf_imgs, axis=0).astype(np.float32)  # [K, 1, H, W]
+            out["sdf_seq"] = torch.from_numpy(sdf_seq)
+
+        return out
