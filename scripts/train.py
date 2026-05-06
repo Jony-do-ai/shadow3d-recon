@@ -734,13 +734,9 @@ def main():
     )
 
     #每10个epoch就对每个类别第一个样本做收敛的可视化观察
-    fixed_vis_max_categories = cfg.get("log", {}).get("fixed_vis_max_categories", None)
-    if fixed_vis_max_categories is not None:
-        fixed_vis_max_categories = int(fixed_vis_max_categories)
-
     fixed_category_samples = build_first_sample_per_category(
         dataset,
-        max_categories=fixed_vis_max_categories,
+        max_categories=None,
     )
 
     print(f"[INFO] Fixed category visualization samples: {len(fixed_category_samples)}")
