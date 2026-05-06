@@ -1,0 +1,48 @@
+seed: 42
+device: "cuda"
+
+data:
+  root: "data/train_runs"
+  sequences_dir: "dataset"
+  image_size: [256, 256]
+  image_key: "shadow_mask.png"
+  batch_size: 2
+  num_workers: 0
+  frames_per_seq: 1
+  frame_sample_mode: uniform
+  frame_order: natural
+  frame_shuffle_seed: 42
+
+test:
+  "data/test_runs"
+
+model:
+  image_feat_dim: 256
+  light_feat_dim: 128
+  fused_dim: 256
+  num_points: 2048
+  temporal_module: mean_max
+  temporal_kernel_size: 3
+  temporal_dilations: [ 1, 2, 4 ]
+  temporal_dropout: 0.1
+
+optim:
+  lr: 1.0e-3
+  epochs: 100
+  weight_decay: 0.0
+
+loss:
+  cd: 1.0
+  center: 0.0
+  bbox: 0.0
+  bbox_radius: 1.0
+
+ablation:
+  use_light: true
+
+log:
+  out_dir: data/train_runs/temporal/E1_single_frame
+  print_every: 10
+  save_every_epoch: 10
+  fixed_vis_every_epoch: 10
+  fixed_vis_max_categories: 10

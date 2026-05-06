@@ -1,6 +1,7 @@
 import os
 import re
 import struct
+import hashlib
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -192,13 +193,16 @@ class ShadowSequenceDataset(Dataset):
     """
 
     def __init__(
-        self,
-        root: str,
-        sequences_dir: str = "dataset",
-        frames_per_seq: int = 10,
-        image_size: Tuple[int, int] = (256, 256),
-        image_key: str = "shadow_mask.png",
-        num_points: int = 2048,
+            self,
+            root: str,
+            sequences_dir: str = "dataset",
+            frames_per_seq: int = 10,
+            image_size: Tuple[int, int] = (256, 256),
+            image_key: str = "shadow_mask.png",
+            num_points: int = 2048,
+            frame_sample_mode: str = "uniform",
+            frame_order: str = "natural",
+            frame_shuffle_seed: int = 42,
     ):
         super().__init__()
         self.root = root
@@ -208,12 +212,90 @@ class ShadowSequenceDataset(Dataset):
         self.image_key = image_key
         self.num_points = num_points
 
+        self.frame_sample_mode = frame_sample_mode
+        self.frame_order = frame_order
+        self.frame_shuffle_seed = int(frame_shuffle_seed)
+
+        valid_sample_modes = {"first", "uniform"}
+        valid_orders = {"natural", "reverse", "shuffle"}
+
+        if self.frame_sample_mode not in valid_sample_modes:
+            raise ValueError(
+                f"Unsupported frame_sample_mode={self.frame_sample_mode}, "
+                f"expected one of {valid_sample_modes}"
+            )
+
+        if self.frame_order not in valid_orders:
+            raise ValueError(
+                f"Unsupported frame_order={self.frame_order}, "
+                f"expected one of {valid_orders}"
+            )
+
         if not os.path.isdir(self.sequences_root):
             raise FileNotFoundError(f"Sequences directory not found: {self.sequences_root}")
 
         self.samples = self._build_index()
         if len(self.samples) == 0:
             raise RuntimeError(f"No valid sequences found under {self.sequences_root}")
+
+    def _select_frame_dirs(self, frame_dirs: List[str], seq_name: str) -> List[str]:
+        """
+        根据配置选择帧，并控制帧顺序。
+
+        frame_sample_mode:
+            first:
+                取前 K 帧。
+            uniform:
+                从完整序列中均匀取 K 帧。
+
+        frame_order:
+            natural:
+                保持正常顺序。
+            reverse:
+                倒序。
+            shuffle:
+                使用固定随机种子打乱顺序。
+        """
+        total_frames = len(frame_dirs)
+        k = self.frames_per_seq
+
+        if total_frames < k:
+            raise ValueError(
+                f"Sequence {seq_name} has only {total_frames} frames, "
+                f"but frames_per_seq={k}"
+            )
+
+        if self.frame_sample_mode == "first":
+            selected = frame_dirs[:k]
+
+        elif self.frame_sample_mode == "uniform":
+            if k == 1:
+                indices = [total_frames // 2]
+            else:
+                indices = np.linspace(0, total_frames - 1, k)
+                indices = np.round(indices).astype(np.int64).tolist()
+
+            selected = [frame_dirs[i] for i in indices]
+
+        else:
+            raise ValueError(f"Unknown frame_sample_mode: {self.frame_sample_mode}")
+
+        if self.frame_order == "natural":
+            return selected
+
+        if self.frame_order == "reverse":
+            return list(reversed(selected))
+
+        if self.frame_order == "shuffle":
+            # 用 seq_name 生成稳定 hash，保证每个样本的 shuffle 顺序可复现
+            digest = hashlib.md5(seq_name.encode("utf-8")).hexdigest()
+            seq_seed = int(digest[:8], 16)
+            rng = np.random.default_rng(self.frame_shuffle_seed + seq_seed)
+
+            perm = rng.permutation(len(selected)).tolist()
+            return [selected[i] for i in perm]
+
+        raise ValueError(f"Unknown frame_order: {self.frame_order}")
 
 
     def _build_index(self) -> List[Dict]:
@@ -249,7 +331,7 @@ class ShadowSequenceDataset(Dataset):
                 if len(frame_dirs) < self.frames_per_seq:
                     continue
 
-                frame_dirs = frame_dirs[:self.frames_per_seq]
+                frame_dirs = self._select_frame_dirs(frame_dirs, seq_name)
 
                 geom_dir = os.path.join(seq_dir, "object_geometry")
                 if not os.path.isdir(geom_dir):

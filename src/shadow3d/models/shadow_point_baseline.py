@@ -1,7 +1,8 @@
-from typing import Tuple
+from typing import Tuple, List
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ConvBlock(nn.Module):
@@ -94,6 +95,122 @@ class PointCloudDecoder(nn.Module):
         x = x.view(z.shape[0], self.num_points, 3)
         return x
 
+class CausalConv1d(nn.Module):
+    """
+    一维因果卷积。
+
+    输入:
+        x: [B, C, K]
+
+    输出:
+        y: [B, C, K]
+
+    因果性的含义:
+        第 t 帧的输出只能看到第 t 帧及其之前的帧，
+        不能看到未来帧。
+    """
+    def __init__(self, channels: int, kernel_size: int = 3, dilation: int = 1):
+        super().__init__()
+        self.left_padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=0,
+            bias=True,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 只在左侧补零，避免看到未来帧
+        x = F.pad(x, (self.left_padding, 0))
+        return self.conv(x)
+
+
+class CausalTemporalBlock(nn.Module):
+    """
+    残差因果时序卷积块。
+
+    输入:
+        x: [B, K, C]
+
+    输出:
+        x: [B, K, C]
+    """
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.conv1 = CausalConv1d(dim, kernel_size=kernel_size, dilation=dilation)
+        self.conv2 = CausalConv1d(dim, kernel_size=kernel_size, dilation=dilation)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+
+        # Conv1d 需要 [B, C, K]
+        y = x.transpose(1, 2)
+
+        y = self.conv1(y)
+        y = self.act(y)
+        y = self.dropout(y)
+
+        y = self.conv2(y)
+        y = self.act(y)
+        y = self.dropout(y)
+
+        # 转回 [B, K, C]
+        y = y.transpose(1, 2)
+
+        # 残差连接 + LayerNorm
+        return self.norm(residual + y)
+
+
+class CausalTemporalEncoder(nn.Module):
+    """
+    多层因果时序卷积模块。
+
+    输入:
+        fused: [B, K, C]
+
+    输出:
+        global_feat: [B, C]
+
+    这里取最后一帧输出，因为最后一帧在 causal conv 中已经看过前面所有帧。
+    """
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: int = 3,
+        dilations: List[int] = None,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if dilations is None:
+            dilations = [1, 2, 4]
+
+        self.blocks = nn.ModuleList([
+            CausalTemporalBlock(
+                dim=dim,
+                kernel_size=kernel_size,
+                dilation=d,
+                dropout=dropout,
+            )
+            for d in dilations
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+
+        # [B, K, C] -> [B, C]
+        return x[:, -1, :]
 
 class ShadowPointBaseline(nn.Module):
     """
@@ -110,14 +227,28 @@ class ShadowPointBaseline(nn.Module):
     输出:
         points:     [B, N, 3]
     """
+
     def __init__(
-        self,
-        image_feat_dim: int = 256,
-        light_feat_dim: int = 128,
-        fused_dim: int = 256,
-        num_points: int = 2048,
+            self,
+            image_feat_dim: int = 256,
+            light_feat_dim: int = 128,
+            fused_dim: int = 256,
+            num_points: int = 2048,
+            temporal_module: str = "mean_max",
+            temporal_kernel_size: int = 3,
+            temporal_dilations: List[int] = None,
+            temporal_dropout: float = 0.1,
     ):
         super().__init__()
+        self.temporal_module = temporal_module
+
+        valid_temporal_modules = {"mean", "max", "mean_max", "causal_conv"}
+        if self.temporal_module not in valid_temporal_modules:
+            raise ValueError(
+                f"Unsupported temporal_module={self.temporal_module}, "
+                f"expected one of {valid_temporal_modules}"
+            )
+
         self.image_encoder = ShadowImageEncoder(feat_dim=image_feat_dim)
         self.light_encoder = LightEncoder(light_feat_dim=light_feat_dim)
 
@@ -128,7 +259,27 @@ class ShadowPointBaseline(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.decoder = PointCloudDecoder(global_dim=fused_dim * 2, num_points=num_points)
+        if self.temporal_module == "causal_conv":
+            self.temporal_encoder = CausalTemporalEncoder(
+                dim=fused_dim,
+                kernel_size=temporal_kernel_size,
+                dilations=temporal_dilations,
+                dropout=temporal_dropout,
+            )
+            decoder_global_dim = fused_dim
+
+        elif self.temporal_module == "mean_max":
+            self.temporal_encoder = None
+            decoder_global_dim = fused_dim * 2
+
+        else:
+            self.temporal_encoder = None
+            decoder_global_dim = fused_dim
+
+        self.decoder = PointCloudDecoder(
+            global_dim=decoder_global_dim,
+            num_points=num_points,
+        )
 
     def forward(self, shadow_seq: torch.Tensor, light_dir: torch.Tensor) -> torch.Tensor:
         """
@@ -144,11 +295,25 @@ class ShadowPointBaseline(nn.Module):
         light_feat = self.light_encoder(light_dir) # [B*K, light_feat_dim]
 
         fused = torch.cat([img_feat, light_feat], dim=-1)
-        fused = self.fusion(fused)                 # [B*K, fused_dim]
-        fused = fused.view(b, k, -1)              # [B, K, fused_dim]
+        fused = self.fusion(fused)  # [B*K, fused_dim]
+        fused = fused.view(b, k, -1)  # [B, K, fused_dim]
 
-        mean_feat = fused.mean(dim=1)
-        max_feat = fused.max(dim=1).values
-        global_feat = torch.cat([mean_feat, max_feat], dim=-1)         # [B, fused_dim]
-        points = self.decoder(global_feat)        # [B, N, 3]
+        if self.temporal_module == "mean":
+            global_feat = fused.mean(dim=1)  # [B, fused_dim]
+
+        elif self.temporal_module == "max":
+            global_feat = fused.max(dim=1).values  # [B, fused_dim]
+
+        elif self.temporal_module == "mean_max":
+            mean_feat = fused.mean(dim=1)  # [B, fused_dim]
+            max_feat = fused.max(dim=1).values  # [B, fused_dim]
+            global_feat = torch.cat([mean_feat, max_feat], dim=-1)  # [B, 2*fused_dim]
+
+        elif self.temporal_module == "causal_conv":
+            global_feat = self.temporal_encoder(fused)  # [B, fused_dim]
+
+        else:
+            raise ValueError(f"Unknown temporal_module: {self.temporal_module}")
+
+        points = self.decoder(global_feat)  # [B, N, 3]
         return points

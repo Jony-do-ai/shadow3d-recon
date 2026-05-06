@@ -361,10 +361,6 @@ def main():
     use_light = bool(ablation_cfg.get("use_light", True))
     print(f"[INFO] use_light = {use_light}")
 
-    ablation_cfg = cfg.get("ablation", {})
-    use_light = bool(ablation_cfg.get("use_light", True))
-    print(f"[INFO] use_light = {use_light}")
-
     seed = int(cfg.get("seed", 42))
     set_seed(seed)
 
@@ -385,6 +381,9 @@ def main():
         image_size=tuple(data_cfg.get("image_size", [256, 256])),
         image_key=data_cfg.get("image_key", "shadow_mask.png"),
         num_points=int(cfg["model"].get("num_points", 2048)),
+        frame_sample_mode=data_cfg.get("frame_sample_mode", "uniform"),
+        frame_order=data_cfg.get("frame_order", "natural"),
+        frame_shuffle_seed=int(data_cfg.get("frame_shuffle_seed", 42)),
     )
 
     #每10个epoch就对每个类别第一个样本做收敛的可视化观察
@@ -422,6 +421,10 @@ def main():
         light_feat_dim=int(model_cfg.get("light_feat_dim", 128)),
         fused_dim=int(model_cfg.get("fused_dim", 256)),
         num_points=int(model_cfg.get("num_points", 2048)),
+        temporal_module=model_cfg.get("temporal_module", "mean_max"),
+        temporal_kernel_size=int(model_cfg.get("temporal_kernel_size", 3)),
+        temporal_dilations=model_cfg.get("temporal_dilations", [1, 2, 4]),
+        temporal_dropout=float(model_cfg.get("temporal_dropout", 0.1)),
     ).to(device)
 
     # -------------------------
