@@ -9,6 +9,9 @@ python scripts/train.py --config configs/temporal/E5_causal_k10_natural.yaml
 python scripts/train.py --config configs/temporal/E6_causal_k10_shuffle.yaml
 python scripts/train.py --config configs/temporal/E7_causal_k10_reverse.yaml
 
+python scripts/train.py --config configs/train_temporal.yaml --resume auto
+python scripts/train.py --config configs/train_temporal.yaml --resume auto --resume-start-epoch 69
+
 
 python scripts/infer.py --config configs/train_default.yaml --checkpoint data/train_runs/shadow_point_baseline/checkpoints/best.pt --all
 
