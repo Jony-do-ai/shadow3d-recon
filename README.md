@@ -1,6 +1,7 @@
 训练：在根目录执行
 python scripts/train.py --config configs/train_default.yaml
-
+续跑
+python scripts/train.py --config configs/train_sdf_fusion.yaml --resume_epoch 60
 
 python scripts/infer.py --config configs/train_default.yaml --checkpoint data/train_runs/shadow_point_baseline/checkpoints/best.pt --all
 

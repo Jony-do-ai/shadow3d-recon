@@ -98,13 +98,50 @@ def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 
-def save_checkpoint(model, optimizer, step, out_path):
+def save_checkpoint(model, optimizer, epoch, global_step, out_path):
     ckpt = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "step": step,
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        # 兼容旧代码里用 step 表示 epoch 的写法
+        "step": int(epoch),
     }
     torch.save(ckpt, out_path)
+
+def load_checkpoint(model, optimizer, ckpt_path, device):
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(
+            f"Resume checkpoint not found: {ckpt_path}\n"
+            f"当前仍按 save_every_epoch 保存编号 checkpoint；"
+            f"请确认你指定的 resume_epoch 对应的 epoch_xxxx.pt 存在。"
+        )
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+
+    if optimizer is not None and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+
+    ckpt_epoch = int(ckpt.get("epoch", ckpt.get("step", 0)))
+    ckpt_global_step = int(ckpt.get("global_step", 0))
+
+    print(f"[RESUME] Loaded checkpoint: {ckpt_path}")
+    print(f"[RESUME] checkpoint_epoch = {ckpt_epoch}, checkpoint_global_step = {ckpt_global_step}")
+    return ckpt_epoch, ckpt_global_step
+
+def truncate_train_log_after_epoch(log_path: str, keep_epoch: int):
+    """
+    续跑时保留 keep_epoch 及之前的日志，删除 keep_epoch 之后的日志。
+    例如 keep_epoch=60：保留 1~60，删除 61 及之后。
+    """
+
+def cleanup_future_epoch_artifacts(out_dir: str, keep_epoch: int):
+    """
+    删除 keep_epoch 之后的编号 checkpoint 和可视化 PLY。
+    例如 keep_epoch=60：删除 epoch_0070.pt、epoch_0080.pt，
+    以及 epoch_0070_pred.ply、epoch_0080_pred.ply 等。
+    """
 
 def format_seconds(seconds: float) -> str:
     """
@@ -379,7 +416,17 @@ def save_fixed_category_predictions(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/train_no_light.yaml")
+    parser.add_argument("--config", type=str, default="configs/train_sdf_fusion.yaml")
+    parser.add_argument(
+        "--resume_epoch",
+        type=int,
+        default=0,
+        help=(
+            "保留并加载哪个已完成的 epoch。"
+            "0 表示从头训练；60 表示加载 epoch_0060.pt，"
+            "然后从 epoch 61 开始训练，并覆盖 60 之后的日志和文件。"
+        ),
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -495,8 +542,21 @@ def main():
         yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
 
     train_log_path = os.path.join(out_dir, "train_log.csv")
-    init_train_log(train_log_path)
     print(f"[INFO] Train log will be saved to: {train_log_path}")
+
+    resume_epoch = args.resume_epoch
+
+    if resume_epoch > 0:
+        ckpt_path = os.path.join(out_dir, "checkpoints", f"epoch_{resume_epoch:04d}.pt")
+        # 注意：这里需要接收返回的 global_step 确保训练曲线连续
+        start_epoch_from_ckpt, global_step = load_checkpoint(model, optimizer, ckpt_path, device)
+        start_epoch = start_epoch_from_ckpt + 1
+
+        truncate_train_log_after_epoch(train_log_path, keep_epoch=resume_epoch)
+    else:
+        init_train_log(train_log_path)
+        start_epoch = 1
+        global_step = 0
 
     # -------------------------
     # train
@@ -511,7 +571,9 @@ def main():
 
     train_start_time = time.time()
 
-    for epoch in range(1, num_epochs + 1):
+    start_epoch = resume_epoch + 1
+
+    for epoch in range(start_epoch, num_epochs + 1):
         epoch_start_time = time.time()
 
         global_step, stats = train_one_epoch(
@@ -580,17 +642,17 @@ def main():
             )
 
         ckpt_latest = os.path.join(out_dir, "checkpoints", "latest.pt")
-        save_checkpoint(model, optimizer, epoch, ckpt_latest)
+        save_checkpoint(model, optimizer, epoch,global_step, ckpt_latest)
 
         if stats["loss_total"] < best_loss:
             best_loss = stats["loss_total"]
             ckpt_best = os.path.join(out_dir, "checkpoints", "best.pt")
-            save_checkpoint(model, optimizer, epoch, ckpt_best)
+            save_checkpoint(model, optimizer, epoch, global_step,ckpt_best)
 
         save_every = int(log_cfg.get("save_every_epoch", 10))
         if epoch % save_every == 0:
             ckpt_path = os.path.join(out_dir, "checkpoints", f"epoch_{epoch:04d}.pt")
-            save_checkpoint(model, optimizer, epoch, ckpt_path)
+            save_checkpoint(model, optimizer, epoch, global_step,ckpt_path)
 
     print("[INFO] Training finished.")
 
