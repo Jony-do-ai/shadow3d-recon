@@ -7,7 +7,14 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+import hashlib
 
+def stable_seed_from_string(s: str) -> int:
+    """
+    根据样本名生成稳定随机种子。
+    避免 Python 内置 hash() 在不同进程/不同运行中变化。
+    """
+    return int(hashlib.md5(s.encode("utf-8")).hexdigest()[:8], 16)
 
 def normalize_points_unit_sphere(points: np.ndarray) -> np.ndarray:
     """
@@ -159,22 +166,29 @@ def read_ply_xyz(ply_path: str) -> np.ndarray:
     raise ValueError(f"Unsupported PLY format in {ply_path}")
 
 
-def sample_or_pad_points(points: np.ndarray, num_points: int) -> np.ndarray:
+def sample_or_pad_points(
+    points: np.ndarray,
+    num_points: int,
+    seed: int = None,
+) -> np.ndarray:
     """
-    将 GT 点云统一到固定点数 num_points
-    - 点数多：随机下采样
+    将 GT 点云统一到固定点数 num_points。
+    - 点数多：下采样
     - 点数少：重复采样补齐
+
+    seed 不为 None 时，同一个样本固定采样。
     """
     n = points.shape[0]
     if n == num_points:
         return points
 
+    rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
+
     if n > num_points:
-        idx = np.random.choice(n, num_points, replace=False)
+        idx = rng.choice(n, num_points, replace=False)
         return points[idx]
 
-    # n < num_points
-    extra = np.random.choice(n, num_points - n, replace=True)
+    extra = rng.choice(n, num_points - n, replace=True)
     idx = np.concatenate([np.arange(n), extra], axis=0)
     return points[idx]
 
@@ -302,7 +316,13 @@ class ShadowSequenceDataset(Dataset):
 
         points_gt = read_ply_xyz(sample["gt_path"])
         points_gt = normalize_points_unit_sphere(points_gt)
-        points_gt = sample_or_pad_points(points_gt, self.num_points).astype(np.float32)
+        sample_seed = stable_seed_from_string(sample["seq_name"])
+
+        points_gt = sample_or_pad_points(
+            points_gt,
+            self.num_points,
+            seed=sample_seed,
+        ).astype(np.float32)
 
         return {
             "shadow_seq": torch.from_numpy(shadow_seq),   # [K, 1, H, W]

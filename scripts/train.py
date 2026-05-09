@@ -136,6 +136,12 @@ def init_train_log(log_path: str):
         "loss_cd",
         "loss_p2g",
         "loss_g2p",
+
+        "loss_hd_raw",
+        "loss_hd",
+        "loss_hd_p2g",
+        "loss_hd_g2p",
+
         "loss_center",
         "loss_bbox",
 
@@ -178,6 +184,12 @@ def append_train_log(
         "loss_cd": float(stats["loss_cd"]),
         "loss_p2g": float(stats["loss_p2g"]),
         "loss_g2p": float(stats["loss_g2p"]),
+
+        "loss_hd_raw": float(stats["loss_hd_raw"]),
+        "loss_hd": float(stats["loss_hd"]),
+        "loss_hd_p2g": float(stats["loss_hd_p2g"]),
+        "loss_hd_g2p": float(stats["loss_hd_g2p"]),
+
         "loss_center": float(stats["loss_center"]),
         "loss_bbox": float(stats["loss_bbox"]),
 
@@ -207,6 +219,12 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
         "loss_cd": 0.0,
         "loss_p2g": 0.0,
         "loss_g2p": 0.0,
+
+        "loss_hd_raw": 0.0,
+        "loss_hd": 0.0,
+        "loss_hd_p2g": 0.0,
+        "loss_hd_g2p": 0.0,
+
         "loss_center": 0.0,
         "loss_bbox": 0.0,
 
@@ -243,6 +261,10 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
             lambda_center=loss_cfg.get("center", 0.1),
             lambda_bbox=loss_cfg.get("bbox", 0.01),
             bbox_radius=loss_cfg.get("bbox_radius", 1.0),
+
+            lambda_hd=loss_cfg.get("hd", 0.0),
+            hd_percentile=loss_cfg.get("hd_percentile", 90.0),
+            hd_mode=loss_cfg.get("hd_mode", "symmetric"),
         )
 
         loss = loss_dict["loss_total"]
@@ -263,6 +285,8 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
             avg_g2p = running["loss_g2p"] / (batch_idx + 1)
             avg_center = running["loss_center"] / (batch_idx + 1)
             avg_bbox = running["loss_bbox"] / (batch_idx + 1)
+            avg_hd_raw = running["loss_hd_raw"] / (batch_idx + 1)
+            avg_hd = running["loss_hd"] / (batch_idx + 1)
             avg_f002 = running["fscore_0_02"] / (batch_idx + 1)
 
             pbar.set_postfix(
@@ -272,6 +296,8 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
                 g2p=f"{avg_g2p:.4f}",
                 # center=f"{avg_center:.4f}",
                 # bbox=f"{avg_bbox:.4f}",
+                hd_raw=f"{avg_hd_raw:.4f}",
+                hd=f"{avg_hd:.4f}",
                 f002=f"{avg_f002:.4f}",
             )
 
@@ -357,10 +383,6 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    ablation_cfg = cfg.get("ablation", {})
-    use_light = bool(ablation_cfg.get("use_light", True))
-    print(f"[INFO] use_light = {use_light}")
-
     ablation_cfg = cfg.get("ablation", {})
     use_light = bool(ablation_cfg.get("use_light", True))
     print(f"[INFO] use_light = {use_light}")
@@ -500,6 +522,10 @@ def main():
             f"p2g={stats['loss_p2g']:.6f}, "
             f"g2p={stats['loss_g2p']:.6f}, "
             f"f@0.02={stats['fscore_0_02']:.6f}, "
+            f"hd_raw={stats['loss_hd_raw']:.6f}, "
+            f"hd={stats['loss_hd']:.6f}, "
+            f"hd_p2g={stats['loss_hd_p2g']:.6f}, "
+            f"hd_g2p={stats['loss_hd_g2p']:.6f}, "
             f"center={stats['loss_center']:.6f}, "
             f"bbox={stats['loss_bbox']:.6f}, "
             f"epoch_time={format_seconds(epoch_time_sec)}, "
