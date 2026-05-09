@@ -116,8 +116,13 @@ class ShadowPointBaseline(nn.Module):
         light_feat_dim: int = 128,
         fused_dim: int = 256,
         num_points: int = 2048,
+        num_frames: int = 10,
     ):
         super().__init__()
+
+        self.num_frames = num_frames
+        self.fused_dim = fused_dim
+
         self.image_encoder = ShadowImageEncoder(feat_dim=image_feat_dim)
         self.light_encoder = LightEncoder(light_feat_dim=light_feat_dim)
 
@@ -128,7 +133,7 @@ class ShadowPointBaseline(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.decoder = PointCloudDecoder(global_dim=fused_dim * 2, num_points=num_points)
+        self.decoder = PointCloudDecoder(global_dim=fused_dim * num_frames, num_points=num_points)
 
     def forward(self, shadow_seq: torch.Tensor, light_dir: torch.Tensor) -> torch.Tensor:
         """
@@ -147,8 +152,7 @@ class ShadowPointBaseline(nn.Module):
         fused = self.fusion(fused)                 # [B*K, fused_dim]
         fused = fused.view(b, k, -1)              # [B, K, fused_dim]
 
-        mean_feat = fused.mean(dim=1)
-        max_feat = fused.max(dim=1).values
-        global_feat = torch.cat([mean_feat, max_feat], dim=-1)         # [B, fused_dim]
+        global_feat = fused.reshape(b, k * fused.shape[-1])  # [B, K * fused_dim]
+
         points = self.decoder(global_feat)        # [B, N, 3]
         return points
