@@ -2,12 +2,18 @@ import os
 import re
 import struct
 from typing import Dict, List, Tuple
-
+import hashlib
 import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+def stable_seed_from_string(s: str) -> int:
+    """
+    根据样本名生成稳定随机种子。
+    避免 Python 内置 hash() 在不同进程/不同运行中变化。
+    """
+    return int(hashlib.md5(s.encode("utf-8")).hexdigest()[:8], 16)
 
 def normalize_points_unit_sphere(points: np.ndarray) -> np.ndarray:
     """
@@ -159,22 +165,22 @@ def read_ply_xyz(ply_path: str) -> np.ndarray:
     raise ValueError(f"Unsupported PLY format in {ply_path}")
 
 
-def sample_or_pad_points(points: np.ndarray, num_points: int) -> np.ndarray:
+def sample_or_pad_points(points: np.ndarray, num_points: int, seed: int = 0) -> np.ndarray:
     """
-    将 GT 点云统一到固定点数 num_points
-    - 点数多：随机下采样
-    - 点数少：重复采样补齐
+    将 GT 点云统一到固定点数 num_points。
+    使用固定随机种子，保证同一个样本每次采样一致。
     """
     n = points.shape[0]
+    rng = np.random.default_rng(seed)
+
     if n == num_points:
         return points
 
     if n > num_points:
-        idx = np.random.choice(n, num_points, replace=False)
+        idx = rng.choice(n, num_points, replace=False)
         return points[idx]
 
-    # n < num_points
-    extra = np.random.choice(n, num_points - n, replace=True)
+    extra = rng.choice(n, num_points - n, replace=True)
     idx = np.concatenate([np.arange(n), extra], axis=0)
     return points[idx]
 
@@ -207,6 +213,7 @@ class ShadowSequenceDataset(Dataset):
         self.image_size = image_size
         self.image_key = image_key
         self.num_points = num_points
+        self.fixed_points_gt = None
 
         if not os.path.isdir(self.sequences_root):
             raise FileNotFoundError(f"Sequences directory not found: {self.sequences_root}")
@@ -214,6 +221,29 @@ class ShadowSequenceDataset(Dataset):
         self.samples = self._build_index()
         if len(self.samples) == 0:
             raise RuntimeError(f"No valid sequences found under {self.sequences_root}")
+
+        self.fixed_points_gt = self._build_fixed_gt_cache()
+
+    def _load_fixed_gt_points(self, sample: Dict) -> np.ndarray:
+        """
+        读取并固定单个样本的 GT 点云。
+        注意：这里的固定包含三件事：
+        1. PLY 原始点云读取；
+        2. 单位球归一化；
+        3. 按 seq_name 生成稳定 seed 后采样/补点到 self.num_points。
+        """
+        points_gt = read_ply_xyz(sample["gt_path"])
+        points_gt = normalize_points_unit_sphere(points_gt)
+        seed = stable_seed_from_string(sample["seq_name"])
+        points_gt = sample_or_pad_points(points_gt, self.num_points, seed=seed)
+        return points_gt.astype(np.float32)
+
+    def _build_fixed_gt_cache(self) -> List[np.ndarray]:
+        """
+        初始化时为所有样本构建固定 GT 点云缓存。
+        后续 __getitem__ 直接取缓存，避免每个 epoch 重新读 PLY / 重新采样。
+        """
+        return [self._load_fixed_gt_points(sample) for sample in self.samples]
 
 
     def _build_index(self) -> List[Dict]:
@@ -300,13 +330,15 @@ class ShadowSequenceDataset(Dataset):
         shadow_seq = np.stack(shadow_imgs, axis=0).astype(np.float32)   # [K, 1, H, W]
         light_dir = np.stack(light_dirs, axis=0).astype(np.float32)     # [K, 3]
 
-        points_gt = read_ply_xyz(sample["gt_path"])
-        points_gt = normalize_points_unit_sphere(points_gt)
-        points_gt = sample_or_pad_points(points_gt, self.num_points).astype(np.float32)
+        if self.fixed_points_gt is not None:
+            points_gt = self.fixed_points_gt[index]
+        else:
+            # 备用路径：即使不缓存，也仍然用稳定 seed，保证同一样本采样固定。
+            points_gt = self._load_fixed_gt_points(sample)
 
         return {
             "shadow_seq": torch.from_numpy(shadow_seq),   # [K, 1, H, W]
             "light_dir": torch.from_numpy(light_dir),     # [K, 3]
-            "points_gt": torch.from_numpy(points_gt),     # [N, 3]
+            "points_gt": torch.from_numpy(points_gt.copy()),     # [N, 3]
             "seq_name": sample["seq_name"],
         }

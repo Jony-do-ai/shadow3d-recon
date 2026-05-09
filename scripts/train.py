@@ -138,6 +138,8 @@ def init_train_log(log_path: str):
         "loss_g2p",
         "loss_center",
         "loss_bbox",
+        "loss_hd",
+        "loss_repulsion",
 
         "precision_0_01",
         "recall_0_01",
@@ -180,6 +182,8 @@ def append_train_log(
         "loss_g2p": float(stats["loss_g2p"]),
         "loss_center": float(stats["loss_center"]),
         "loss_bbox": float(stats["loss_bbox"]),
+        "loss_hd": float(stats.get("loss_hd", 0.0)),
+        "loss_repulsion": float(stats.get("loss_repulsion", 0.0)),
 
         "precision_0_01": float(stats["precision_0_01"]),
         "recall_0_01": float(stats["recall_0_01"]),
@@ -209,6 +213,8 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
         "loss_g2p": 0.0,
         "loss_center": 0.0,
         "loss_bbox": 0.0,
+        "loss_hd": 0.0,
+        "loss_repulsion": 0.0,
 
         "precision_0_01": 0.0,
         "recall_0_01": 0.0,
@@ -243,6 +249,11 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
             lambda_center=loss_cfg.get("center", 0.1),
             lambda_bbox=loss_cfg.get("bbox", 0.01),
             bbox_radius=loss_cfg.get("bbox_radius", 1.0),
+            lambda_hd=loss_cfg.get("hd", 0.0),
+            hd_top_ratio=loss_cfg.get("hd_top_ratio", 0.1),
+            lambda_repulsion=loss_cfg.get("repulsion", 0.0),
+            repulsion_radius=loss_cfg.get("repulsion_radius", 0.03),
+            repulsion_k=loss_cfg.get("repulsion_k", 16),
         )
 
         loss = loss_dict["loss_total"]
@@ -263,6 +274,8 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
             avg_g2p = running["loss_g2p"] / (batch_idx + 1)
             avg_center = running["loss_center"] / (batch_idx + 1)
             avg_bbox = running["loss_bbox"] / (batch_idx + 1)
+            avg_hd = running["loss_hd"] / (batch_idx + 1)
+            avg_rep = running["loss_repulsion"] / (batch_idx + 1)
             avg_f002 = running["fscore_0_02"] / (batch_idx + 1)
 
             pbar.set_postfix(
@@ -270,6 +283,8 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
                 cd=f"{avg_cd:.4f}",
                 p2g=f"{avg_p2g:.4f}",
                 g2p=f"{avg_g2p:.4f}",
+                hd=f"{avg_hd:.4f}",
+                rep=f"{avg_rep:.4f}",
                 # center=f"{avg_center:.4f}",
                 # bbox=f"{avg_bbox:.4f}",
                 f002=f"{avg_f002:.4f}",
@@ -358,11 +373,10 @@ def main():
 
     cfg = load_config(args.config)
     ablation_cfg = cfg.get("ablation", {})
+    model_cfg = cfg["model"]
     use_light = bool(ablation_cfg.get("use_light", True))
-    print(f"[INFO] use_light = {use_light}")
-
-    ablation_cfg = cfg.get("ablation", {})
-    use_light = bool(ablation_cfg.get("use_light", True))
+    use_pct_refiner = bool(model_cfg.get("use_pct_refiner", True))
+    pct_use_condition = bool(model_cfg.get("pct_use_condition", True))
     print(f"[INFO] use_light = {use_light}")
 
     seed = int(cfg.get("seed", 42))
@@ -417,11 +431,24 @@ def main():
     # model
     # -------------------------
     model_cfg = cfg["model"]
+    pct_qk_dim = model_cfg.get("pct_qk_dim", None)
+    if pct_qk_dim is not None:
+        pct_qk_dim = int(pct_qk_dim)
+
     model = ShadowPointBaseline(
         image_feat_dim=int(model_cfg.get("image_feat_dim", 256)),
         light_feat_dim=int(model_cfg.get("light_feat_dim", 128)),
         fused_dim=int(model_cfg.get("fused_dim", 256)),
         num_points=int(model_cfg.get("num_points", 2048)),
+        use_pct_refiner=bool(model_cfg.get("use_pct_refiner", False)),
+        pct_hidden_dim=int(model_cfg.get("pct_hidden_dim", 128)),
+        pct_coord_dim=int(model_cfg.get("pct_coord_dim", 64)),
+        pct_shadow_dim=int(model_cfg.get("pct_shadow_dim", 128)),
+        pct_blocks=int(model_cfg.get("pct_blocks", 4)),
+        pct_knn_k=int(model_cfg.get("pct_knn_k", 16)),
+        pct_delta_scale=float(model_cfg.get("pct_delta_scale", 0.05)),
+        pct_qk_dim=pct_qk_dim,
+        pct_use_condition=bool(model_cfg.get("pct_use_condition", True)),
     ).to(device)
 
     # -------------------------
@@ -502,6 +529,8 @@ def main():
             f"f@0.02={stats['fscore_0_02']:.6f}, "
             f"center={stats['loss_center']:.6f}, "
             f"bbox={stats['loss_bbox']:.6f}, "
+            f"hd={stats.get('loss_hd', 0.0):.6f}, "
+            f"rep={stats.get('loss_repulsion', 0.0):.6f}, "
             f"epoch_time={format_seconds(epoch_time_sec)}, "
             f"elapsed={format_seconds(elapsed_sec)}, "
             f"eta={format_seconds(remaining_sec)}, "

@@ -31,7 +31,7 @@ loss:
   bbox_radius: 1.0
 
 ablation:
-  use_light: false
+  use_light: true
 
 log:
   out_dir: data/train_runs/exp_no_light
