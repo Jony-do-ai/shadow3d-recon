@@ -159,7 +159,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to epoch_xxxx.pt")
     parser.add_argument("--index", type=int, default=0, help="Dataset sample index")
     parser.add_argument("--all", action="store_true", help="Infer all samples in dataset")
-    parser.add_argument("--output_dir", type=str, default="outputs/infer", help="Where to save results")
+    parser.add_argument("--base_out_dir", type=str, default="infer", help="Base directory to save results")
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
     args = parser.parse_args()
 
@@ -167,6 +167,16 @@ def main():
     print(f"[INFO] Using device: {device}")
 
     cfg = load_config(args.config)
+    # --- 获取消融实验名称并构建输出路径 ---
+    log_out_dir = cfg.get("log", {}).get("out_dir", "")
+    if log_out_dir:
+        # os.path.normpath 处理尾部可能存在的斜杠，basename 获取最后一级目录名（即消融实验名）
+        exp_name = os.path.basename(os.path.normpath(log_out_dir))
+    else:
+        exp_name = "default_exp"
+
+    final_output_dir = os.path.join(args.base_out_dir, exp_name)
+    print(f"[INFO] Output directory set to: {final_output_dir}")
 
     dataset = build_dataset_from_config(cfg)
     print(f"[INFO] Dataset size: {len(dataset)}")
@@ -190,7 +200,7 @@ def main():
             device=device,
         )
 
-        save_dir = os.path.join(args.output_dir, seq_name)
+        save_dir = os.path.join(final_output_dir, seq_name)
         ensure_dir(save_dir)
 
         pred_ply_path = os.path.join(save_dir, "pred.ply")
