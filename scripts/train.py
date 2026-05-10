@@ -449,6 +449,7 @@ def main():
         pct_delta_scale=float(model_cfg.get("pct_delta_scale", 0.05)),
         pct_qk_dim=pct_qk_dim,
         pct_use_condition=bool(model_cfg.get("pct_use_condition", True)),
+        num_frames=int(model_cfg.get("num_frames", 10)),
     ).to(device)
 
     # -------------------------

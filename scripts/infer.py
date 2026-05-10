@@ -63,16 +63,21 @@ def build_model_from_config(cfg: Dict[str, Any], device: torch.device) -> Shadow
     """
     model_cfg = cfg.get("model", {})
 
-    image_feat_dim = model_cfg.get("image_feat_dim", cfg.get("image_feat_dim", 256))
-    light_feat_dim = model_cfg.get("light_feat_dim", cfg.get("light_feat_dim", 128))
-    fused_dim = model_cfg.get("fused_dim", cfg.get("fused_dim", 256))
-    num_points = model_cfg.get("num_points", cfg.get("num_points", 2048))
-
     model = ShadowPointBaseline(
-        image_feat_dim=image_feat_dim,
-        light_feat_dim=light_feat_dim,
-        fused_dim=fused_dim,
-        num_points=num_points,
+        image_feat_dim=int(model_cfg.get("image_feat_dim", 256)),
+        light_feat_dim=int(model_cfg.get("light_feat_dim", 128)),
+        fused_dim=int(model_cfg.get("fused_dim", 256)),
+        num_points=int(model_cfg.get("num_points", 2048)),
+        use_pct_refiner=bool(model_cfg.get("use_pct_refiner", True)),
+        pct_hidden_dim=int(model_cfg.get("pct_hidden_dim", 128)),
+        pct_coord_dim=int(model_cfg.get("pct_coord_dim", 64)),
+        pct_shadow_dim=int(model_cfg.get("pct_shadow_dim", 128)),
+        pct_blocks=int(model_cfg.get("pct_blocks", 4)),
+        pct_knn_k=int(model_cfg.get("pct_knn_k", 16)),
+        pct_delta_scale=float(model_cfg.get("pct_delta_scale", 0.05)),
+        pct_qk_dim=model_cfg.get("pct_qk_dim", None),
+        pct_use_condition=bool(model_cfg.get("pct_use_condition", True)),
+        num_frames=int(model_cfg.get("num_frames", 10)),
     )
     model.to(device)
     return model

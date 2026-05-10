@@ -1,5 +1,5 @@
 训练：在根目录执行
-python scripts/train.py --config configs/train_default.yaml
+python scripts/train.py --config configs/train_pct.yaml
 
 
 python scripts/infer.py --config configs/train_pct.yaml --checkpoint data/train_runs/pct_refiner/checkpoints/best.pt --all
