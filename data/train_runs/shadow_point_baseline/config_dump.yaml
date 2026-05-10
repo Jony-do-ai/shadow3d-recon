@@ -25,6 +25,8 @@ loss:
   center: 0.0
   bbox: 0.0
   bbox_radius: 1.0
+ablation:
+  use_light: true
 log:
   out_dir: data/train_runs/shadow_point_baseline
   print_every: 10
