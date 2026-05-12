@@ -1,6 +1,6 @@
 import math
 from typing import Optional
-
+from .module import NeighborEmbedding, OA
 import torch
 import torch.nn as nn
 
@@ -311,6 +311,56 @@ class ShadowConditionedPCTRefiner(nn.Module):
         return refined_points
 
 
+class OriginalPaperPCTRefiner(nn.Module):
+    def __init__(self, num_points=2048, delta_scale=0.01):
+        super().__init__()
+
+        self.num_points = num_points
+        self.delta_scale = delta_scale
+
+        # samples=[2048, 2048] 可以保证输出点数还是 2048
+        self.neighbor_embedding = NeighborEmbedding(samples=[num_points, num_points])
+
+        self.oa1 = OA(256)
+        self.oa2 = OA(256)
+        self.oa3 = OA(256)
+        self.oa4 = OA(256)
+
+        self.delta_head = nn.Sequential(
+            nn.Conv1d(1024, 512, 1),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(512, 3, 1),
+        )
+
+        # 关键：让 refiner 初始时接近 identity，不要一开始就把点云拉乱
+        nn.init.zeros_(self.delta_head[-1].weight)
+        nn.init.zeros_(self.delta_head[-1].bias)
+
+    def forward(self, coarse_points, global_feat=None):
+        """
+        coarse_points: [B, 2048, 3]
+        return:        [B, 2048, 3]
+        """
+        x = coarse_points.transpose(1, 2).contiguous()  # [B, 3, 2048]
+
+        # 注意：NeighborEmbedding 现在返回采样后的坐标和特征
+        sampled_points, x = self.neighbor_embedding(x)  # sampled_points: [B, 2048, 3], x: [B, 256, 2048]
+
+        x1 = self.oa1(x)
+        x2 = self.oa2(x1)
+        x3 = self.oa3(x2)
+        x4 = self.oa4(x3)
+
+        x_concat = torch.cat([x1, x2, x3, x4], dim=1)  # [B, 1024, 2048]
+
+        delta = self.delta_head(x_concat)              # [B, 3, 2048]
+        delta = self.delta_scale * torch.tanh(delta)   # [B, 3, 2048]
+
+        refined_points = sampled_points + delta.transpose(1, 2).contiguous()
+
+        return refined_points
+
 class ShadowPointBaseline(nn.Module):
     """
     Baseline + Shadow-conditioned PCT Refiner:
@@ -331,7 +381,7 @@ class ShadowPointBaseline(nn.Module):
         pct_shadow_dim: int = 128,
         pct_blocks: int = 4,
         pct_knn_k: int = 16,
-        pct_delta_scale: float = 0.05,
+        pct_delta_scale: float = 0.01,
         pct_qk_dim: Optional[int] = None,
         pct_use_condition: bool = True,
     ):
@@ -353,16 +403,9 @@ class ShadowPointBaseline(nn.Module):
         self.decoder = PointCloudDecoder(global_dim=self.global_dim, num_points=num_points)
 
         if self.use_pct_refiner:
-            self.pct_refiner = ShadowConditionedPCTRefiner(
-                global_dim=self.global_dim,
-                hidden_dim=pct_hidden_dim,
-                coord_dim=pct_coord_dim,
-                shadow_dim=pct_shadow_dim,
-                num_blocks=pct_blocks,
-                knn_k=pct_knn_k,
+            self.pct_refiner = OriginalPaperPCTRefiner(
+                num_points=num_points,
                 delta_scale=pct_delta_scale,
-                qk_dim=pct_qk_dim,
-                use_condition=pct_use_condition,
             )
         else:
             self.pct_refiner = None
@@ -392,3 +435,5 @@ class ShadowPointBaseline(nn.Module):
 
         refined_points = self.pct_refiner(coarse_points, global_feat)     # [B, N, 3]
         return refined_points
+
+
