@@ -76,3 +76,5 @@ class AdaptiveProbabilisticMatchingLoss(nn.Module):
 
         loss = torch.sum(P * cost, dim=(1, 2)).mean()
         return loss
+
+APML = AdaptiveProbabilisticMatchingLoss

@@ -1,0 +1,68 @@
+seed: 42
+device: cuda
+
+ablation:
+  use_light: true
+
+data:
+  root: data/train_runs
+  sequences_dir: dataset
+  frames_per_seq: 10
+  image_size: [256, 256]
+  image_key: shadow_mask.png
+  batch_size: 2
+  num_workers: 0
+
+test:
+  "data/test_runs"
+
+
+model:
+  image_feat_dim: 256
+  light_feat_dim: 128
+  fused_dim: 256
+  num_points: 2048
+
+  # PCT Refiner 开关与配置
+  use_pct_refiner: true
+  pct_hidden_dim: 128
+  pct_coord_dim: 64
+  pct_shadow_dim: 128
+  pct_blocks: 4
+  pct_knn_k: 16
+  pct_delta_scale: 0.01
+  pct_qk_dim: 32
+  pct_use_condition: true
+
+loss:
+  point_loss_type: apml
+
+  # APML 主 loss
+  apml_weight: 0.001
+  apml_p_min: 0.8
+  apml_sinkhorn_iters: 20
+
+  # CD 在 APML 模式下不参与训练，只作为指标保留
+  cd: 0.0
+
+  center: 0.0
+  bbox: 0.0
+  bbox_radius: 1.0
+
+  # 先只开 PCT 时，可以把 hd/repulsion 设 0。
+  # 确认稳定后再逐步打开。
+  hd: 0.00
+  hd_top_ratio: 0.1
+  repulsion: 0.005
+  repulsion_radius: 0.03
+  repulsion_k: 16
+
+optim:
+  lr: 0.0005
+  weight_decay: 0.0
+  epochs: 100
+
+log:
+  out_dir: data/train_runs/apml-pct
+  print_every: 10
+  save_every_epoch: 10

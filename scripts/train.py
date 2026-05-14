@@ -21,6 +21,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from shadow3d.datasets.shadow_sequence_dataset import ShadowSequenceDataset
 from shadow3d.losses.chamfer import point_recon_loss
+from shadow3d.losses.apml_loss import APML
 from shadow3d.models.shadow_point_baseline import ShadowPointBaseline
 
 import open3d as o3d
@@ -134,6 +135,7 @@ def init_train_log(log_path: str):
         "lr",
         "loss_total",
         "loss_cd",
+        "loss_apml",
         "loss_p2g",
         "loss_g2p",
         "loss_center",
@@ -178,6 +180,7 @@ def append_train_log(
         "lr": lr,
         "loss_total": float(stats["loss_total"]),
         "loss_cd": float(stats["loss_cd"]),
+        "loss_apml": float(stats.get("loss_apml", 0.0)),
         "loss_p2g": float(stats["loss_p2g"]),
         "loss_g2p": float(stats["loss_g2p"]),
         "loss_center": float(stats["loss_center"]),
@@ -204,11 +207,82 @@ def append_train_log(
         writer = csv.DictWriter(f, fieldnames=row.keys())
         writer.writerow(row)
 
-def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, global_step, log_every=10, save_ply_every=5, out_dir=None,use_light=True,):
+def compute_point_loss_dict(
+    pred_points: torch.Tensor,
+    points_gt: torch.Tensor,
+    loss_cfg: dict,
+    apml_criterion=None,
+):
+    """
+    统一计算点云 loss。
+
+    point_loss_type = "cd":
+        保持原来的 point_recon_loss，不改变训练逻辑。
+
+    point_loss_type = "apml":
+        用 APML 替代 CD 参与训练；
+        但仍然调用 point_recon_loss 计算 loss_cd / p2g / g2p / fscore 等指标，
+        方便和以前日志对比。
+    """
+    point_loss_type = str(loss_cfg.get("point_loss_type", "cd")).lower()
+
+    if point_loss_type == "cd":
+        loss_dict = point_recon_loss(
+            pred=pred_points,
+            gt=points_gt,
+            lambda_cd=loss_cfg.get("cd", 1.0),
+            lambda_center=loss_cfg.get("center", 0.1),
+            lambda_bbox=loss_cfg.get("bbox", 0.01),
+            bbox_radius=loss_cfg.get("bbox_radius", 1.0),
+            lambda_hd=loss_cfg.get("hd", 0.0),
+            hd_top_ratio=loss_cfg.get("hd_top_ratio", 0.1),
+            lambda_repulsion=loss_cfg.get("repulsion", 0.0),
+            repulsion_radius=loss_cfg.get("repulsion_radius", 0.03),
+            repulsion_k=loss_cfg.get("repulsion_k", 16),
+        )
+        loss_dict["loss_apml"] = pred_points.new_tensor(0.0)
+        return loss_dict
+
+    if point_loss_type == "apml":
+        if apml_criterion is None:
+            raise RuntimeError("point_loss_type='apml' but apml_criterion is None.")
+
+        # 1. APML 是真正参与反向传播的主点云 loss
+        loss_apml = apml_criterion(pred_points, points_gt)
+        apml_weight = float(loss_cfg.get("apml_weight", 1.0))
+
+        # 2. 仍然计算 CD / P2G / G2P / F-score，用来做指标和日志
+        #    这里 lambda_cd=0.0，意思是 CD 不参与训练总 loss。
+        metric_dict = point_recon_loss(
+            pred=pred_points,
+            gt=points_gt,
+            lambda_cd=0.0,
+            lambda_center=loss_cfg.get("center", 0.0),
+            lambda_bbox=loss_cfg.get("bbox", 0.0),
+            bbox_radius=loss_cfg.get("bbox_radius", 1.0),
+            lambda_hd=loss_cfg.get("hd", 0.0),
+            hd_top_ratio=loss_cfg.get("hd_top_ratio", 0.1),
+            lambda_repulsion=loss_cfg.get("repulsion", 0.0),
+            repulsion_radius=loss_cfg.get("repulsion_radius", 0.03),
+            repulsion_k=loss_cfg.get("repulsion_k", 16),
+        )
+
+        # metric_dict["loss_total"] 现在只包含 center / bbox / hd / repulsion 等非 CD 项
+        # 最终训练 loss = APML + 原来的非 CD 正则项
+        reg_loss = metric_dict["loss_total"]
+        metric_dict["loss_apml"] = loss_apml
+        metric_dict["loss_total"] = apml_weight * loss_apml + reg_loss
+
+        return metric_dict
+
+    raise ValueError(f"Unknown point_loss_type: {point_loss_type}")
+
+def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, global_step, log_every=10, save_ply_every=5, out_dir=None,use_light=True,apml_criterion=None,):
     model.train()
     running = {
         "loss_total": 0.0,
         "loss_cd": 0.0,
+        "loss_apml": 0.0,
         "loss_p2g": 0.0,
         "loss_g2p": 0.0,
         "loss_center": 0.0,
@@ -242,18 +316,11 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
 
         pred_points = model(shadow_seq, light_dir)
 
-        loss_dict = point_recon_loss(
-            pred=pred_points,
-            gt=points_gt,
-            lambda_cd=loss_cfg.get("cd", 1.0),
-            lambda_center=loss_cfg.get("center", 0.1),
-            lambda_bbox=loss_cfg.get("bbox", 0.01),
-            bbox_radius=loss_cfg.get("bbox_radius", 1.0),
-            lambda_hd=loss_cfg.get("hd", 0.0),
-            hd_top_ratio=loss_cfg.get("hd_top_ratio", 0.1),
-            lambda_repulsion=loss_cfg.get("repulsion", 0.0),
-            repulsion_radius=loss_cfg.get("repulsion_radius", 0.03),
-            repulsion_k=loss_cfg.get("repulsion_k", 16),
+        loss_dict = compute_point_loss_dict(
+            pred_points=pred_points,
+            points_gt=points_gt,
+            loss_cfg=loss_cfg,
+            apml_criterion=apml_criterion,
         )
 
         loss = loss_dict["loss_total"]
@@ -270,6 +337,7 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
         if (batch_idx + 1) % log_every == 0 or (batch_idx + 1) == len(loader):
             avg_total = running["loss_total"] / (batch_idx + 1)
             avg_cd = running["loss_cd"] / (batch_idx + 1)
+            avg_apml = running["loss_apml"] / (batch_idx + 1)
             avg_p2g = running["loss_p2g"] / (batch_idx + 1)
             avg_g2p = running["loss_g2p"] / (batch_idx + 1)
             avg_center = running["loss_center"] / (batch_idx + 1)
@@ -281,6 +349,7 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
             pbar.set_postfix(
                 total=f"{avg_total:.4f}",
                 cd=f"{avg_cd:.4f}",
+                apml=f"{avg_apml:.4f}",
                 p2g=f"{avg_p2g:.4f}",
                 g2p=f"{avg_g2p:.4f}",
                 hd=f"{avg_hd:.4f}",
@@ -484,6 +553,30 @@ def main():
     # train
     # -------------------------
     loss_cfg = cfg["loss"]
+    point_loss_type = str(loss_cfg.get("point_loss_type", "cd")).lower()
+
+    apml_criterion = None
+    if point_loss_type == "apml":
+        apml_criterion = None
+        if point_loss_type == "apml":
+            apml_criterion = APML(
+                min_softmax_value=float(loss_cfg.get("apml_p_min", 0.8)),
+            ).to(device)
+
+            print(
+                f"[INFO] point_loss_type = APML, "
+                f"min_softmax_value={loss_cfg.get('apml_p_min', 0.8)}"
+            )
+        else:
+            print("[INFO] point_loss_type = CD")
+        print(
+            f"[INFO] point_loss_type = APML, "
+            f"p_min={loss_cfg.get('apml_p_min', 0.8)}, "
+            f"sinkhorn_iters={loss_cfg.get('apml_sinkhorn_iters', 20)}"
+        )
+    else:
+        print("[INFO] point_loss_type = CD")
+
     global_step = 0
     best_loss = float("inf")
 
@@ -508,6 +601,7 @@ def main():
             save_ply_every=int(log_cfg.get("save_ply_every", 5)),  # 每5个epoch保存一次
             out_dir=out_dir,
             use_light=use_light,
+            apml_criterion=apml_criterion,
         )
         # 每个 epoch 都计算训练耗时
         epoch_time_sec = time.time() - epoch_start_time
@@ -525,6 +619,7 @@ def main():
             f"[Epoch {epoch:03d}/{num_epochs:03d}] "
             f"total={stats['loss_total']:.6f}, "
             f"cd={stats['loss_cd']:.6f}, "
+            f"apml={stats.get('loss_apml', 0.0):.6f}, "
             f"p2g={stats['loss_p2g']:.6f}, "
             f"g2p={stats['loss_g2p']:.6f}, "
             f"f@0.02={stats['fscore_0_02']:.6f}, "
