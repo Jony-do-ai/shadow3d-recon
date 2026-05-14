@@ -24,7 +24,7 @@ model:
   num_points: 2048
 
   # PCT Refiner 开关与配置
-  use_pct_refiner: true
+  use_pct_refiner: false
   pct_hidden_dim: 128
   pct_coord_dim: 64
   pct_shadow_dim: 128
@@ -63,6 +63,6 @@ optim:
   epochs: 100
 
 log:
-  out_dir: data/train_runs/apml-pct
+  out_dir: data/train_runs/apml-nopct
   print_every: 10
   save_every_epoch: 10

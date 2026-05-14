@@ -164,7 +164,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to epoch_xxxx.pt")
     parser.add_argument("--index", type=int, default=0, help="Dataset sample index")
     parser.add_argument("--all", action="store_true", help="Infer all samples in dataset")
-    parser.add_argument("--base_out_dir", type=str, default="infer", help="Base directory to save results")
+    parser.add_argument("--base_out_dir", type=str, default="outputs/infer", help="Base directory to save results")
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
     args = parser.parse_args()
 
