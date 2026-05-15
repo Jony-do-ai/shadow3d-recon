@@ -22,6 +22,7 @@ if str(SRC_ROOT) not in sys.path:
 from shadow3d.datasets.shadow_sequence_dataset import ShadowSequenceDataset
 from shadow3d.losses.chamfer import point_recon_loss
 from shadow3d.losses.apml_loss import APML
+from shadow3d.losses.proj_edge_loss import LightProjectionEdgeLoss
 from shadow3d.models.shadow_point_baseline import ShadowPointBaseline
 
 import open3d as o3d
@@ -136,6 +137,7 @@ def init_train_log(log_path: str):
         "loss_total",
         "loss_cd",
         "loss_apml",
+        "loss_proj_edge",
         "loss_p2g",
         "loss_g2p",
         "loss_center",
@@ -181,6 +183,7 @@ def append_train_log(
         "loss_total": float(stats["loss_total"]),
         "loss_cd": float(stats["loss_cd"]),
         "loss_apml": float(stats.get("loss_apml", 0.0)),
+        "loss_proj_edge": float(stats.get("loss_proj_edge", 0.0)),
         "loss_p2g": float(stats["loss_p2g"]),
         "loss_g2p": float(stats["loss_g2p"]),
         "loss_center": float(stats["loss_center"]),
@@ -277,12 +280,16 @@ def compute_point_loss_dict(
 
     raise ValueError(f"Unknown point_loss_type: {point_loss_type}")
 
-def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, global_step, log_every=10, save_ply_every=5, out_dir=None,use_light=True,apml_criterion=None,):
+def train_one_epoch(model, loader, optimizer, device,
+                    loss_cfg, epoch_idx, global_step,
+                    log_every=10, save_ply_every=5, out_dir=None,
+                    use_light=True,apml_criterion=None,proj_edge_loss_fn=None, proj_edge_weight=0.0,proj_edge_run_every_batch=1,):
     model.train()
     running = {
         "loss_total": 0.0,
         "loss_cd": 0.0,
         "loss_apml": 0.0,
+        "loss_proj_edge": 0.0,
         "loss_p2g": 0.0,
         "loss_g2p": 0.0,
         "loss_center": 0.0,
@@ -323,6 +330,34 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
             apml_criterion=apml_criterion,
         )
 
+        # 默认没有投影边界 loss
+        loss_proj_edge = pred_points.new_tensor(0.0)
+
+        use_proj_edge_this_batch = (
+                proj_edge_loss_fn is not None
+                and proj_edge_weight > 0.0
+                and use_light
+                and proj_edge_run_every_batch > 0
+                and (batch_idx % proj_edge_run_every_batch == 0)
+        )
+
+        if use_proj_edge_this_batch:
+            loss_proj_edge = proj_edge_loss_fn(
+                pred_points=pred_points,
+                gt_points=points_gt,
+                light_dir=light_dir,
+            )
+
+            # 因为不是每个 batch 都算，所以这里乘 run_every_batch，
+            # 让平均梯度强度大致接近“每 batch 都算”的情况。
+            loss_dict["loss_total"] = (
+                    loss_dict["loss_total"]
+                    + proj_edge_weight * proj_edge_run_every_batch * loss_proj_edge
+            )
+        else:
+            loss_dict["loss_total"] = loss_dict["loss_total"]
+
+        loss_dict["loss_proj_edge"] = loss_proj_edge
         loss = loss_dict["loss_total"]
 
         optimizer.zero_grad()
@@ -338,6 +373,7 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
             avg_total = running["loss_total"] / (batch_idx + 1)
             avg_cd = running["loss_cd"] / (batch_idx + 1)
             avg_apml = running["loss_apml"] / (batch_idx + 1)
+            avg_proj_edge = running["loss_proj_edge"] / (batch_idx + 1)
             avg_p2g = running["loss_p2g"] / (batch_idx + 1)
             avg_g2p = running["loss_g2p"] / (batch_idx + 1)
             avg_center = running["loss_center"] / (batch_idx + 1)
@@ -350,6 +386,7 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
                 total=f"{avg_total:.4f}",
                 cd=f"{avg_cd:.4f}",
                 apml=f"{avg_apml:.4f}",
+                pe=f"{avg_proj_edge:.4f}",
                 p2g=f"{avg_p2g:.4f}",
                 g2p=f"{avg_g2p:.4f}",
                 hd=f"{avg_hd:.4f}",
@@ -555,6 +592,45 @@ def main():
     loss_cfg = cfg["loss"]
     point_loss_type = str(loss_cfg.get("point_loss_type", "cd")).lower()
 
+    proj_edge_cfg = loss_cfg.get("proj_edge", {})
+    proj_edge_loss_fn = None
+    proj_edge_weight = 0.0
+    proj_edge_run_every_batch = 1
+
+    if bool(proj_edge_cfg.get("enabled", False)):
+        if not use_light:
+            print("[WARN] proj_edge enabled but use_light=False, disable proj_edge loss.")
+        else:
+            proj_edge_weight = float(proj_edge_cfg.get("weight", 0.01))
+            proj_edge_run_every_batch = int(proj_edge_cfg.get("run_every_batch", 1))
+
+            proj_edge_loss_fn = LightProjectionEdgeLoss(
+                num_dirs=int(proj_edge_cfg.get("num_dirs", 64)),
+                squared=bool(proj_edge_cfg.get("squared", True)),
+                max_frames=int(proj_edge_cfg.get("max_frames", 1)),
+                frame_stride=int(proj_edge_cfg.get("frame_stride", 1)),
+                random_frames=bool(proj_edge_cfg.get("random_frames", True)),
+                random_rotate_dirs=bool(proj_edge_cfg.get("random_rotate_dirs", True)),
+                support_weight=float(proj_edge_cfg.get("support_weight", 1.0)),
+                chamfer_weight=float(proj_edge_cfg.get("chamfer_weight", 0.5)),
+                use_smooth_l1=bool(proj_edge_cfg.get("use_smooth_l1", True)),
+            ).to(device)
+
+            print(
+                f"[INFO] proj_edge enabled: "
+                f"weight={proj_edge_weight}, "
+                f"num_dirs={proj_edge_cfg.get('num_dirs', 64)}, "
+                f"max_frames={proj_edge_cfg.get('max_frames', 1)}, "
+                f"frame_stride={proj_edge_cfg.get('frame_stride', 1)}, "
+                f"random_frames={proj_edge_cfg.get('random_frames', True)}, "
+                f"random_rotate_dirs={proj_edge_cfg.get('random_rotate_dirs', True)}, "
+                f"support_weight={proj_edge_cfg.get('support_weight', 1.0)}, "
+                f"chamfer_weight={proj_edge_cfg.get('chamfer_weight', 0.5)}, "
+                f"run_every_batch={proj_edge_run_every_batch}"
+            )
+    else:
+        print("[INFO] proj_edge disabled")
+
     apml_criterion = None
     if point_loss_type == "apml":
         apml_criterion = None
@@ -598,10 +674,13 @@ def main():
             epoch_idx=epoch,
             global_step=global_step,
             log_every=int(log_cfg.get("print_every", 10)),
-            save_ply_every=int(log_cfg.get("save_ply_every", 5)),  # 每5个epoch保存一次
+            save_ply_every=int(log_cfg.get("save_ply_every", 5)),
             out_dir=out_dir,
             use_light=use_light,
             apml_criterion=apml_criterion,
+            proj_edge_loss_fn=proj_edge_loss_fn,
+            proj_edge_weight=proj_edge_weight,
+            proj_edge_run_every_batch=proj_edge_run_every_batch,
         )
         # 每个 epoch 都计算训练耗时
         epoch_time_sec = time.time() - epoch_start_time
@@ -620,6 +699,7 @@ def main():
             f"total={stats['loss_total']:.6f}, "
             f"cd={stats['loss_cd']:.6f}, "
             f"apml={stats.get('loss_apml', 0.0):.6f}, "
+            f"proj_edge={stats.get('loss_proj_edge', 0.0):.6f}, "
             f"p2g={stats['loss_p2g']:.6f}, "
             f"g2p={stats['loss_g2p']:.6f}, "
             f"f@0.02={stats['fscore_0_02']:.6f}, "
