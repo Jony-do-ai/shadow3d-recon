@@ -1,0 +1,98 @@
+seed: 42
+device: cuda
+
+ablation:
+  use_light: true
+
+data:
+  root: data/train_runs
+  sequences_dir: dataset
+  frames_per_seq: 10
+  image_size: [256, 256]
+  image_key: shadow_mask.png
+  batch_size: 2
+  num_workers: 0
+
+model:
+  image_feat_dim: 256
+  light_feat_dim: 128
+  fused_dim: 256
+  num_points: 2048
+  num_frames: 10
+
+  # 第一阶段粗模型保持无 PCT
+  use_pct_refiner: false
+
+  # 第二阶段物理细化模块
+  use_phys_refiner: true
+  phys_hidden_dim: 128
+  phys_global_context_dim: 64
+  phys_light_context_dim: 32
+  phys_delta_scale: 0.04
+  phys_fuse: mean
+
+stage2:
+  enabled: true
+  # 改成你已经训练好的 CNN+APML checkpoint
+  coarse_ckpt: data/train_runs/apml-nopct/checkpoints/best.pt
+  freeze_coarse: true
+  strict_load: false
+
+loss:
+  # 第一版第二阶段不让 APML 主导，只保留 CD/APML 指标。
+  # 如果希望完全不算 APML，设 cd + cd:0.0 最省时间。
+  point_loss_type: cd
+
+  # APML 主 loss
+  apml_weight: 0.001
+  apml_p_min: 0.8
+  apml_sinkhorn_iters: 20
+
+  cd: 0.0
+
+  center: 0.0
+  bbox: 0.0
+  hd: 0.0
+  repulsion: 0.0
+
+  # 旧的 support-direction proj_edge 关闭
+  proj_edge:
+    enabled: false
+
+  # 新的 dense grid boundary loss
+  dense_boundary:
+    enabled: true
+    weight: 0.03
+    grid_size: 64
+    value_range: [-1.5, 1.5]
+    splat_radius: 1
+    boundary_band: 1
+    max_boundary_points: 2048
+    squared: true
+    p2g_weight: 0.5
+    g2p_weight: 1.0
+    run_every_batch: 1
+
+  # 第一版默认关闭；代码预留。如果边界修坏 3D，再打开。
+  moved_3d:
+    enabled: false
+    weight: 0.03
+    mode: p2g_only
+
+  # refiner 修正量正则
+  delta_reg:
+    enabled: true
+    weight: 0.001
+
+optim:
+  lr: 0.0005
+  weight_decay: 0.0
+  epochs: 30
+
+log:
+  out_dir: data/train_runs/apml-shadow-2part
+  print_every: 10
+  save_every_epoch: 10
+  fixed_vis_every_epoch: 10
+  fixed_vis_max_categories: null
+  save_stage2_coarse_every_time: true
