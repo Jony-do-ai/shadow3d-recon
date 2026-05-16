@@ -3,6 +3,7 @@ from typing import Optional
 from .module import NeighborEmbedding, OA
 import torch
 import torch.nn as nn
+from .projection_physics_refiner import MultiLightProjectionPhysicsRefiner
 
 
 class ConvBlock(nn.Module):
@@ -384,6 +385,13 @@ class ShadowPointBaseline(nn.Module):
         pct_delta_scale: float = 0.01,
         pct_qk_dim: Optional[int] = None,
         pct_use_condition: bool = True,
+
+        use_phys_refiner: bool = False,
+        phys_hidden_dim: int = 128,
+        phys_global_context_dim: int = 64,
+        phys_light_context_dim: int = 32,
+        phys_delta_scale: float = 0.02,
+        phys_fuse: str = "mean",
     ):
         super().__init__()
         self.num_frames = num_frames
@@ -410,6 +418,20 @@ class ShadowPointBaseline(nn.Module):
         else:
             self.pct_refiner = None
 
+        self.use_phys_refiner = bool(use_phys_refiner)
+
+        if self.use_phys_refiner:
+            self.phys_refiner = MultiLightProjectionPhysicsRefiner(
+                global_dim=self.global_dim,
+                hidden_dim=phys_hidden_dim,
+                global_context_dim=phys_global_context_dim,
+                light_context_dim=phys_light_context_dim,
+                delta_scale=phys_delta_scale,
+                fuse=phys_fuse,
+            )
+        else:
+            self.phys_refiner = None
+
     def encode_global_feature(self, shadow_seq: torch.Tensor, light_dir: torch.Tensor) -> torch.Tensor:
         b, k, c, h, w = shadow_seq.shape
 
@@ -426,14 +448,39 @@ class ShadowPointBaseline(nn.Module):
         global_feat = fused.reshape(b, k * fused.shape[-1])  # [B, K * fused_dim]
         return global_feat
 
-    def forward(self, shadow_seq: torch.Tensor, light_dir: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self,
+            shadow_seq: torch.Tensor,
+            light_dir: torch.Tensor,
+            return_coarse: bool = False,
+            return_delta: bool = False,
+    ):
         global_feat = self.encode_global_feature(shadow_seq, light_dir)  # [B, global_dim]
-        coarse_points = self.decoder(global_feat)                        # [B, N, 3]
+        coarse_points = self.decoder(global_feat)  # [B, N, 3]
 
-        if self.pct_refiner is None:
-            return coarse_points
+        # 如果以后仍想兼容 PCT，可以先让 PCT 输出作为 phys_refiner 的输入。
+        # 但二阶段第一版建议 use_pct_refiner=false。
+        base_points = coarse_points
+        if self.pct_refiner is not None:
+            base_points = self.pct_refiner(base_points, global_feat)
 
-        refined_points = self.pct_refiner(coarse_points, global_feat)     # [B, N, 3]
-        return refined_points
+        delta_3d = None
+        pred_points = base_points
 
+        if self.phys_refiner is not None:
+            pred_points, delta_3d = self.phys_refiner(
+                coarse_points=base_points,
+                light_dir=light_dir,
+                global_feat=global_feat,
+            )
+
+        if return_coarse and return_delta:
+            if delta_3d is None:
+                delta_3d = torch.zeros_like(pred_points)
+            return pred_points, base_points, delta_3d
+
+        if return_coarse:
+            return pred_points, base_points
+
+        return pred_points
 

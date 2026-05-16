@@ -68,7 +68,7 @@ def build_model_from_config(cfg: Dict[str, Any], device: torch.device) -> Shadow
         light_feat_dim=int(model_cfg.get("light_feat_dim", 128)),
         fused_dim=int(model_cfg.get("fused_dim", 256)),
         num_points=int(model_cfg.get("num_points", 2048)),
-        use_pct_refiner=bool(model_cfg.get("use_pct_refiner", True)),
+        use_pct_refiner=bool(model_cfg.get("use_pct_refiner", False)),
         pct_hidden_dim=int(model_cfg.get("pct_hidden_dim", 128)),
         pct_coord_dim=int(model_cfg.get("pct_coord_dim", 64)),
         pct_shadow_dim=int(model_cfg.get("pct_shadow_dim", 128)),
@@ -78,6 +78,13 @@ def build_model_from_config(cfg: Dict[str, Any], device: torch.device) -> Shadow
         pct_qk_dim=model_cfg.get("pct_qk_dim", None),
         pct_use_condition=bool(model_cfg.get("pct_use_condition", True)),
         num_frames=int(model_cfg.get("num_frames", 10)),
+
+        use_phys_refiner=bool(model_cfg.get("use_phys_refiner", False)),
+        phys_hidden_dim=int(model_cfg.get("phys_hidden_dim", 128)),
+        phys_global_context_dim=int(model_cfg.get("phys_global_context_dim", 64)),
+        phys_light_context_dim=int(model_cfg.get("phys_light_context_dim", 32)),
+        phys_delta_scale=float(model_cfg.get("phys_delta_scale", 0.02)),
+        phys_fuse=str(model_cfg.get("phys_fuse", "mean")),
     )
     model.to(device)
     return model
@@ -87,7 +94,14 @@ def build_dataset_from_config(cfg: Dict[str, Any]) -> ShadowSequenceDataset:
     data_cfg = cfg["data"]
 
     # 推理时优先使用 test 路径；没有的话再退回训练集 root
-    root = cfg.get("test", data_cfg["root"])
+    test_cfg = cfg.get("test", None)
+
+    if isinstance(test_cfg, dict):
+        root = test_cfg.get("root", data_cfg["root"])
+    elif isinstance(test_cfg, str):
+        root = test_cfg
+    else:
+        root = data_cfg["root"]
 
     dataset = ShadowSequenceDataset(
         root=root,

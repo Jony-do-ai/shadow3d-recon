@@ -24,9 +24,8 @@ from shadow3d.losses.chamfer import point_recon_loss
 from shadow3d.losses.apml_loss import APML
 from shadow3d.losses.proj_edge_loss import LightProjectionEdgeLoss
 from shadow3d.models.shadow_point_baseline import ShadowPointBaseline
-
+from shadow3d.losses.dense_projection_boundary_loss import DenseProjectionBoundaryLoss
 import open3d as o3d
-
 
 def save_point_cloud_ply(points: torch.Tensor, ply_path: str) -> None:
     """
@@ -108,6 +107,66 @@ def save_checkpoint(model, optimizer, step, out_path):
     }
     torch.save(ckpt, out_path)
 
+def load_model_checkpoint(model, ckpt_path: str, device, strict: bool = False):
+    if ckpt_path is None or str(ckpt_path).strip() == "":
+        return
+
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        state_dict = ckpt["model"]
+    else:
+        state_dict = ckpt
+
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            new_state_dict[k[len("module."):]] = v
+        else:
+            new_state_dict[k] = v
+
+    missing, unexpected = model.load_state_dict(new_state_dict, strict=strict)
+    print(f"[INFO] Loaded coarse checkpoint: {ckpt_path}")
+    if missing:
+        print(f"[WARN] Missing keys: {missing}")
+    if unexpected:
+        print(f"[WARN] Unexpected keys: {unexpected}")
+
+
+def freeze_coarse_model_for_stage2(model):
+    """
+    第二阶段只训练 phys_refiner。
+    """
+    for name, p in model.named_parameters():
+        if name.startswith("phys_refiner"):
+            p.requires_grad = True
+        else:
+            p.requires_grad = False
+
+    print("[INFO] Stage2 freeze: only phys_refiner parameters are trainable.")
+
+
+def set_stage2_train_mode(model):
+    """
+    model.train() 会把所有 BatchNorm 重新切回 train。
+    第二阶段需要粗模型保持 eval，只让 phys_refiner train。
+    """
+    model.train()
+
+    model.image_encoder.eval()
+    model.light_encoder.eval()
+    model.fusion.eval()
+    model.decoder.eval()
+
+    if getattr(model, "pct_refiner", None) is not None:
+        model.pct_refiner.eval()
+
+    if getattr(model, "phys_refiner", None) is not None:
+        model.phys_refiner.train()
+
 def format_seconds(seconds: float) -> str:
     """
     将秒数格式化为 h m s，方便打印训练用时。
@@ -140,6 +199,15 @@ def init_train_log(log_path: str):
         "loss_proj_edge",
         "loss_p2g",
         "loss_g2p",
+
+        "loss_dense_boundary",
+        "loss_dense_p2g",
+        "loss_dense_g2p",
+        "loss_moved_3d",
+        "loss_delta_reg",
+        "delta_mean",
+        "delta_max",
+
         "loss_center",
         "loss_bbox",
         "loss_hd",
@@ -186,6 +254,15 @@ def append_train_log(
         "loss_proj_edge": float(stats.get("loss_proj_edge", 0.0)),
         "loss_p2g": float(stats["loss_p2g"]),
         "loss_g2p": float(stats["loss_g2p"]),
+
+        "loss_dense_boundary": float(stats.get("loss_dense_boundary", 0.0)),
+        "loss_dense_p2g": float(stats.get("loss_dense_p2g", 0.0)),
+        "loss_dense_g2p": float(stats.get("loss_dense_g2p", 0.0)),
+        "loss_moved_3d": float(stats.get("loss_moved_3d", 0.0)),
+        "loss_delta_reg": float(stats.get("loss_delta_reg", 0.0)),
+        "delta_mean": float(stats.get("delta_mean", 0.0)),
+        "delta_max": float(stats.get("delta_max", 0.0)),
+
         "loss_center": float(stats["loss_center"]),
         "loss_bbox": float(stats["loss_bbox"]),
         "loss_hd": float(stats.get("loss_hd", 0.0)),
@@ -283,8 +360,24 @@ def compute_point_loss_dict(
 def train_one_epoch(model, loader, optimizer, device,
                     loss_cfg, epoch_idx, global_step,
                     log_every=10, save_ply_every=5, out_dir=None,
-                    use_light=True,apml_criterion=None,proj_edge_loss_fn=None, proj_edge_weight=0.0,proj_edge_run_every_batch=1,):
-    model.train()
+                    use_light=True,apml_criterion=None,proj_edge_loss_fn=None, proj_edge_weight=0.0,proj_edge_run_every_batch=1,
+
+                    stage2_enabled=False,
+                    dense_boundary_loss_fn=None,
+                    dense_boundary_weight=0.0,
+                    dense_boundary_run_every_batch=1,
+
+                    moved_3d_enabled=False,
+                    moved_3d_weight=0.0,
+                    delta_reg_enabled=False,
+                    delta_reg_weight=0.0,
+                    ):
+
+    if stage2_enabled:
+        set_stage2_train_mode(model)
+    else:
+        model.train()
+
     running = {
         "loss_total": 0.0,
         "loss_cd": 0.0,
@@ -292,6 +385,15 @@ def train_one_epoch(model, loader, optimizer, device,
         "loss_proj_edge": 0.0,
         "loss_p2g": 0.0,
         "loss_g2p": 0.0,
+
+        "loss_dense_boundary": 0.0,
+        "loss_dense_p2g": 0.0,
+        "loss_dense_g2p": 0.0,
+        "loss_moved_3d": 0.0,
+        "loss_delta_reg": 0.0,
+        "delta_mean": 0.0,
+        "delta_max": 0.0,
+
         "loss_center": 0.0,
         "loss_bbox": 0.0,
         "loss_hd": 0.0,
@@ -321,7 +423,17 @@ def train_one_epoch(model, loader, optimizer, device,
         if not use_light:
             light_dir = torch.zeros_like(light_dir)
 
-        pred_points = model(shadow_seq, light_dir)
+        if stage2_enabled:
+            pred_points, coarse_points, delta_3d = model(
+                shadow_seq,
+                light_dir,
+                return_coarse=True,
+                return_delta=True,
+            )
+        else:
+            pred_points = model(shadow_seq, light_dir)
+            coarse_points = None
+            delta_3d = None
 
         loss_dict = compute_point_loss_dict(
             pred_points=pred_points,
@@ -358,6 +470,65 @@ def train_one_epoch(model, loader, optimizer, device,
             loss_dict["loss_total"] = loss_dict["loss_total"]
 
         loss_dict["loss_proj_edge"] = loss_proj_edge
+
+        loss_dense_boundary = pred_points.new_tensor(0.0)
+        loss_dense_p2g = pred_points.new_tensor(0.0)
+        loss_dense_g2p = pred_points.new_tensor(0.0)
+        loss_moved_3d = pred_points.new_tensor(0.0)
+
+        use_dense_this_batch = (
+            dense_boundary_loss_fn is not None
+            and dense_boundary_weight > 0.0
+            and use_light
+            and dense_boundary_run_every_batch > 0
+            and (batch_idx % dense_boundary_run_every_batch == 0)
+        )
+
+        if use_dense_this_batch:
+            dense_out = dense_boundary_loss_fn(
+                pred_points=pred_points,
+                gt_points=points_gt,
+                light_dir=light_dir,
+                compute_moved_3d=bool(moved_3d_enabled),
+            )
+
+            loss_dense_boundary = dense_out["loss_boundary"]
+            loss_dense_p2g = dense_out["loss_p2g"]
+            loss_dense_g2p = dense_out["loss_g2p"]
+            loss_moved_3d = dense_out["loss_moved_3d"]
+
+            loss_dict["loss_total"] = (
+                loss_dict["loss_total"]
+                + dense_boundary_weight * dense_boundary_run_every_batch * loss_dense_boundary
+            )
+
+            if moved_3d_enabled and moved_3d_weight > 0.0:
+                loss_dict["loss_total"] = (
+                    loss_dict["loss_total"]
+                    + moved_3d_weight * dense_boundary_run_every_batch * loss_moved_3d
+                )
+
+        loss_delta_reg = pred_points.new_tensor(0.0)
+        delta_mean = pred_points.new_tensor(0.0)
+        delta_max = pred_points.new_tensor(0.0)
+
+        if stage2_enabled and delta_3d is not None:
+            delta_norm = torch.norm(delta_3d, dim=-1)
+            delta_mean = delta_norm.mean()
+            delta_max = delta_norm.max()
+
+            if delta_reg_enabled and delta_reg_weight > 0.0:
+                loss_delta_reg = (delta_3d ** 2).sum(dim=-1).mean()
+                loss_dict["loss_total"] = loss_dict["loss_total"] + delta_reg_weight * loss_delta_reg
+
+        loss_dict["loss_dense_boundary"] = loss_dense_boundary
+        loss_dict["loss_dense_p2g"] = loss_dense_p2g
+        loss_dict["loss_dense_g2p"] = loss_dense_g2p
+        loss_dict["loss_moved_3d"] = loss_moved_3d
+        loss_dict["loss_delta_reg"] = loss_delta_reg
+        loss_dict["delta_mean"] = delta_mean
+        loss_dict["delta_max"] = delta_max
+
         loss = loss_dict["loss_total"]
 
         optimizer.zero_grad()
@@ -376,6 +547,8 @@ def train_one_epoch(model, loader, optimizer, device,
             avg_proj_edge = running["loss_proj_edge"] / (batch_idx + 1)
             avg_p2g = running["loss_p2g"] / (batch_idx + 1)
             avg_g2p = running["loss_g2p"] / (batch_idx + 1)
+            avg_dense = running["loss_dense_boundary"] / (batch_idx + 1)
+            avg_delta = running["delta_mean"] / (batch_idx + 1)
             avg_center = running["loss_center"] / (batch_idx + 1)
             avg_bbox = running["loss_bbox"] / (batch_idx + 1)
             avg_hd = running["loss_hd"] / (batch_idx + 1)
@@ -389,6 +562,8 @@ def train_one_epoch(model, loader, optimizer, device,
                 pe=f"{avg_proj_edge:.4f}",
                 p2g=f"{avg_p2g:.4f}",
                 g2p=f"{avg_g2p:.4f}",
+                db=f"{avg_dense:.4f}",
+                dmean=f"{avg_delta:.4f}",
                 hd=f"{avg_hd:.4f}",
                 rep=f"{avg_rep:.4f}",
                 # center=f"{avg_center:.4f}",
@@ -433,6 +608,8 @@ def save_fixed_category_predictions(
     epoch_idx,
     out_dir,
     use_light=True,
+    stage2_enabled=False,
+    save_stage2_coarse_every_time=True,
 ):
     """
     每隔若干 epoch，对每个类别的固定样本保存预测点云。
@@ -450,7 +627,15 @@ def save_fixed_category_predictions(
             if not use_light:
                 light_dir = torch.zeros_like(light_dir)
 
-            pred_points = model(shadow_seq, light_dir)
+            if stage2_enabled:
+                pred_points, coarse_points = model(
+                    shadow_seq,
+                    light_dir,
+                    return_coarse=True,
+                )
+            else:
+                pred_points = model(shadow_seq, light_dir)
+                coarse_points = None
 
             # 沿用原来的 point_clouds 目录
             save_dir = os.path.join(out_dir, "point_clouds", seq_name)
@@ -462,15 +647,36 @@ def save_fixed_category_predictions(
                 save_point_cloud_ply(points_gt[0], gt_save_path)
 
             # 预测点云每 10 个 epoch 保存一次
-            pred_save_path = os.path.join(
-                save_dir,
-                f"epoch_{epoch_idx:04d}_pred.ply"
-            )
+            if stage2_enabled and coarse_points is not None:
+                if save_stage2_coarse_every_time:
+                    coarse_save_path = os.path.join(
+                        save_dir,
+                        f"epoch_{epoch_idx:04d}_coarse.ply"
+                    )
+                else:
+                    coarse_save_path = os.path.join(save_dir, "coarse.ply")
+
+                if save_stage2_coarse_every_time or not os.path.isfile(coarse_save_path):
+                    save_point_cloud_ply(coarse_points[0], coarse_save_path)
+
+                pred_save_path = os.path.join(
+                    save_dir,
+                    f"epoch_{epoch_idx:04d}_refined.ply"
+                )
+            else:
+                pred_save_path = os.path.join(
+                    save_dir,
+                    f"epoch_{epoch_idx:04d}_pred.ply"
+                )
+
             save_point_cloud_ply(pred_points[0], pred_save_path)
 
     print(f"[VIS] Saved fixed category predictions for epoch {epoch_idx}")
 
-    model.train()
+    if stage2_enabled:
+        set_stage2_train_mode(model)
+    else:
+        model.train()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -556,14 +762,42 @@ def main():
         pct_qk_dim=pct_qk_dim,
         pct_use_condition=bool(model_cfg.get("pct_use_condition", True)),
         num_frames=int(model_cfg.get("num_frames", 10)),
+
+        use_phys_refiner=bool(model_cfg.get("use_phys_refiner", False)),
+        phys_hidden_dim=int(model_cfg.get("phys_hidden_dim", 128)),
+        phys_global_context_dim=int(model_cfg.get("phys_global_context_dim", 64)),
+        phys_light_context_dim=int(model_cfg.get("phys_light_context_dim", 32)),
+        phys_delta_scale=float(model_cfg.get("phys_delta_scale", 0.02)),
+        phys_fuse=str(model_cfg.get("phys_fuse", "mean")),
     ).to(device)
 
     # -------------------------
     # optim
     # -------------------------
     optim_cfg = cfg["optim"]
+
+    stage2_cfg = cfg.get("stage2", {})
+    stage2_enabled = bool(stage2_cfg.get("enabled", False))
+
+    if stage2_enabled:
+        coarse_ckpt = stage2_cfg.get("coarse_ckpt", "")
+        strict_load = bool(stage2_cfg.get("strict_load", False))
+
+        load_model_checkpoint(
+            model=model,
+            ckpt_path=coarse_ckpt,
+            device=device,
+            strict=strict_load,
+        )
+
+        if bool(stage2_cfg.get("freeze_coarse", True)):
+            freeze_coarse_model_for_stage2(model)
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    print(f"[INFO] Trainable parameter tensors: {len(trainable_params)}")
+
     optimizer = torch.optim.Adam(
-        model.parameters(),
+        trainable_params,
         lr=float(optim_cfg.get("lr", 1e-3)),
         weight_decay=float(optim_cfg.get("weight_decay", 0.0)),
     )
@@ -653,6 +887,49 @@ def main():
     else:
         print("[INFO] point_loss_type = CD")
 
+    dense_cfg = loss_cfg.get("dense_boundary", {})
+    dense_boundary_loss_fn = None
+    dense_boundary_weight = 0.0
+    dense_boundary_run_every_batch = 1
+
+    if bool(dense_cfg.get("enabled", False)):
+        if not use_light:
+            print("[WARN] dense_boundary enabled but use_light=False, disable dense_boundary.")
+        else:
+            dense_boundary_weight = float(dense_cfg.get("weight", 0.01))
+            dense_boundary_run_every_batch = int(dense_cfg.get("run_every_batch", 1))
+
+            dense_boundary_loss_fn = DenseProjectionBoundaryLoss(
+                grid_size=int(dense_cfg.get("grid_size", 64)),
+                value_range=tuple(dense_cfg.get("value_range", [-1.5, 1.5])),
+                splat_radius=int(dense_cfg.get("splat_radius", 1)),
+                boundary_band=int(dense_cfg.get("boundary_band", 1)),
+                max_boundary_points=int(dense_cfg.get("max_boundary_points", 512)),
+                squared=bool(dense_cfg.get("squared", True)),
+                p2g_weight=float(dense_cfg.get("p2g_weight", 0.5)),
+                g2p_weight=float(dense_cfg.get("g2p_weight", 1.0)),
+            ).to(device)
+
+            print(
+                f"[INFO] dense_boundary enabled: "
+                f"weight={dense_boundary_weight}, "
+                f"grid_size={dense_cfg.get('grid_size', 64)}, "
+                f"value_range={dense_cfg.get('value_range', [-1.5, 1.5])}, "
+                f"max_boundary_points={dense_cfg.get('max_boundary_points', 512)}, "
+                f"run_every_batch={dense_boundary_run_every_batch}"
+            )
+    else:
+        print("[INFO] dense_boundary disabled")
+
+    moved_3d_cfg = loss_cfg.get("moved_3d", {})
+    moved_3d_enabled = bool(moved_3d_cfg.get("enabled", False))
+    moved_3d_weight = float(moved_3d_cfg.get("weight", 0.0))
+
+    delta_reg_cfg = loss_cfg.get("delta_reg", {})
+    delta_reg_enabled = bool(delta_reg_cfg.get("enabled", False))
+    delta_reg_weight = float(delta_reg_cfg.get("weight", 0.0))
+
+
     global_step = 0
     best_loss = float("inf")
 
@@ -681,6 +958,14 @@ def main():
             proj_edge_loss_fn=proj_edge_loss_fn,
             proj_edge_weight=proj_edge_weight,
             proj_edge_run_every_batch=proj_edge_run_every_batch,
+            stage2_enabled=stage2_enabled,
+            dense_boundary_loss_fn=dense_boundary_loss_fn,
+            dense_boundary_weight=dense_boundary_weight,
+            dense_boundary_run_every_batch=dense_boundary_run_every_batch,
+            moved_3d_enabled=moved_3d_enabled,
+            moved_3d_weight=moved_3d_weight,
+            delta_reg_enabled=delta_reg_enabled,
+            delta_reg_weight=delta_reg_weight,
         )
         # 每个 epoch 都计算训练耗时
         epoch_time_sec = time.time() - epoch_start_time
@@ -703,6 +988,10 @@ def main():
             f"p2g={stats['loss_p2g']:.6f}, "
             f"g2p={stats['loss_g2p']:.6f}, "
             f"f@0.02={stats['fscore_0_02']:.6f}, "
+            f"dense={stats.get('loss_dense_boundary', 0.0):.6f}, "
+            f"moved3d={stats.get('loss_moved_3d', 0.0):.6f}, "
+            f"dreg={stats.get('loss_delta_reg', 0.0):.6f}, "
+            f"dmean={stats.get('delta_mean', 0.0):.6f}, "
             f"center={stats['loss_center']:.6f}, "
             f"bbox={stats['loss_bbox']:.6f}, "
             f"hd={stats.get('loss_hd', 0.0):.6f}, "
@@ -734,6 +1023,10 @@ def main():
                 epoch_idx=epoch,
                 out_dir=out_dir,
                 use_light=use_light,
+                stage2_enabled=stage2_enabled,
+                save_stage2_coarse_every_time=bool(
+                    log_cfg.get("save_stage2_coarse_every_time", True)
+                ),
             )
 
         ckpt_latest = os.path.join(out_dir, "checkpoints", "latest.pt")
