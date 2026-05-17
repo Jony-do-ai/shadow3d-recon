@@ -352,7 +352,7 @@ def train_one_epoch(model, loader, optimizer, device,
             # 让平均梯度强度大致接近“每 batch 都算”的情况。
             loss_dict["loss_total"] = (
                     loss_dict["loss_total"]
-                    + proj_edge_weight * proj_edge_run_every_batch * loss_proj_edge
+                    + proj_edge_weight * loss_proj_edge
             )
         else:
             loss_dict["loss_total"] = loss_dict["loss_total"]
@@ -605,27 +605,36 @@ def main():
             proj_edge_run_every_batch = int(proj_edge_cfg.get("run_every_batch", 1))
 
             proj_edge_loss_fn = LightProjectionEdgeLoss(
+                # 兼容旧配置：num_dirs 仍可用；新逻辑里它等价于 grid_size。
                 num_dirs=int(proj_edge_cfg.get("num_dirs", 64)),
+                grid_size=int(proj_edge_cfg.get("grid_size", proj_edge_cfg.get("num_dirs", 64))),
+                grid_padding=float(proj_edge_cfg.get("grid_padding", 0.05)),
+                grid_sigma=float(proj_edge_cfg.get("grid_sigma", 1.0)),
+                grid_chunk_size=int(proj_edge_cfg.get("grid_chunk_size", 1024)),
+                grid_pos_weight=float(proj_edge_cfg.get("grid_pos_weight", 4.0)),
+
                 squared=bool(proj_edge_cfg.get("squared", True)),
                 max_frames=int(proj_edge_cfg.get("max_frames", 1)),
                 frame_stride=int(proj_edge_cfg.get("frame_stride", 1)),
                 random_frames=bool(proj_edge_cfg.get("random_frames", True)),
                 random_rotate_dirs=bool(proj_edge_cfg.get("random_rotate_dirs", True)),
                 support_weight=float(proj_edge_cfg.get("support_weight", 1.0)),
-                chamfer_weight=float(proj_edge_cfg.get("chamfer_weight", 0.5)),
+                chamfer_weight=float(proj_edge_cfg.get("chamfer_weight", 0.0)),
                 use_smooth_l1=bool(proj_edge_cfg.get("use_smooth_l1", True)),
             ).to(device)
 
             print(
-                f"[INFO] proj_edge enabled: "
+                f"[INFO] proj_edge grid enabled: "
                 f"weight={proj_edge_weight}, "
-                f"num_dirs={proj_edge_cfg.get('num_dirs', 64)}, "
+                f"grid_size={proj_edge_cfg.get('grid_size', proj_edge_cfg.get('num_dirs', 64))}, "
+                f"grid_padding={proj_edge_cfg.get('grid_padding', 0.05)}, "
+                f"grid_sigma={proj_edge_cfg.get('grid_sigma', 1.0)}, "
+                f"grid_chunk_size={proj_edge_cfg.get('grid_chunk_size', 1024)}, "
+                f"grid_pos_weight={proj_edge_cfg.get('grid_pos_weight', 4.0)}, "
                 f"max_frames={proj_edge_cfg.get('max_frames', 1)}, "
                 f"frame_stride={proj_edge_cfg.get('frame_stride', 1)}, "
                 f"random_frames={proj_edge_cfg.get('random_frames', True)}, "
-                f"random_rotate_dirs={proj_edge_cfg.get('random_rotate_dirs', True)}, "
                 f"support_weight={proj_edge_cfg.get('support_weight', 1.0)}, "
-                f"chamfer_weight={proj_edge_cfg.get('chamfer_weight', 0.5)}, "
                 f"run_every_batch={proj_edge_run_every_batch}"
             )
     else:

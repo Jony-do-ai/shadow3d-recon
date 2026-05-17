@@ -1,7 +1,76 @@
-import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# proj_edge_loss.py 新增两个函数，替换 forward 里的 loss 计算部分
+def compute_soft_boundary_map(occ: torch.Tensor, pool_size: int = 3) -> torch.Tensor:
+    """
+    从 soft occupancy map 提取边界响应。
+    occ: [B, 1, G, G]
+    return: boundary_map [B, 1, G, G]，边界处值高，内部/背景接近 0
+    """
+    # max_pool 膨胀一圈，减去原图，边界处差值最大
+    dilated = F.max_pool2d(occ, kernel_size=pool_size, stride=1,
+                           padding=pool_size // 2)
+    boundary = (dilated - occ).clamp(min=0.0)
+    # 归一化到 [0, 1]
+    b_max = boundary.amax(dim=(-1, -2), keepdim=True).clamp(min=1e-6)
+    return boundary / b_max
+
+
+def sample_boundary_weight_per_point(
+    uv_norm: torch.Tensor,
+    boundary_map: torch.Tensor,
+) -> torch.Tensor:
+    """
+    把边界图采样到每个点的 uv 坐标上，得到 per-point 边界权重。
+    uv_norm:      [B, N, 2]，归一化到 [0,1]
+    boundary_map: [B, 1, G, G]
+    return:       [B, N]，每个点的边界权重
+    """
+    # grid_sample 要求坐标在 [-1, 1]
+    grid = uv_norm * 2.0 - 1.0          # [B, N, 2]
+    grid = grid.unsqueeze(1)             # [B, 1, N, 2]
+
+    # bilinear 插值，完全可微
+    w = F.grid_sample(
+        boundary_map,
+        grid,
+        mode='bilinear',
+        padding_mode='zeros',   # 超出边界的点权重=0，自然忽略
+        align_corners=True,
+    )                                    # [B, 1, 1, N]
+    return w.squeeze(1).squeeze(1)       # [B, N]
+
+
+def weighted_chamfer_2d(
+    uv_pred: torch.Tensor,
+    uv_gt: torch.Tensor,
+    weights: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    在 2D 投影平面上做加权单向 CD（pred → gt 方向）。
+    uv_pred:  [B, N, 2]
+    uv_gt:    [B, M, 2]
+    weights:  [B, N]，每个 pred 点的边界权重
+    return:   scalar loss
+    """
+    # pred 每个点到 gt 最近点的距离
+    dist = torch.cdist(uv_pred, uv_gt)  # [B, N, M]
+
+    # pred→gt：加权，聚焦边界
+    min_p2g, _ = dist.min(dim=-1)  # [B, N]
+    w_sum = weights.sum(dim=-1).clamp(min=eps)
+    loss_p2g = (weights * min_p2g ** 2).sum(dim=-1) / w_sum  # [B]
+
+    # gt→pred：不加权，保证覆盖率
+    min_g2p, _ = dist.min(dim=-2)  # [B, M]
+    loss_g2p = min_g2p.pow(2).mean(dim=-1)  # [B]
+
+    return (loss_p2g + loss_g2p).mean()
 
 
 def make_light_plane_basis(light_dir: torch.Tensor, eps: float = 1e-6):
@@ -48,79 +117,125 @@ def project_to_light_plane(points: torch.Tensor, light_dir: torch.Tensor):
     return torch.stack([x, y], dim=-1)
 
 
-def make_support_dirs(
-    num_dirs: int,
-    device,
-    dtype,
-    random_rotate: bool = False,
+def normalize_uv_by_gt_box(
+    uv: torch.Tensor,
+    uv_gt: torch.Tensor,
+    padding: float = 0.05,
+    eps: float = 1e-6,
 ):
     """
+    用 GT 投影范围定义 2D grid 坐标系。
+
+    uv:    [B, N, 2]
+    uv_gt: [B, M, 2]
+
     return:
-        dirs: [D, 2]
+        uv_norm: [B, N, 2]，大致落在 [0, 1]
     """
-    if random_rotate:
-        offset = torch.rand((), device=device, dtype=dtype) * (2.0 * math.pi / num_dirs)
+    gt_min = uv_gt.detach().amin(dim=1)  # [B, 2]
+    gt_max = uv_gt.detach().amax(dim=1)  # [B, 2]
+
+    center = 0.5 * (gt_min + gt_max)     # [B, 2]
+    extent = gt_max - gt_min             # [B, 2]
+
+    # 用统一尺度保持投影平面中的长宽比例，避免 x/y 被分别拉伸导致形状变形。
+    scale = extent.amax(dim=-1, keepdim=True).clamp_min(eps)
+    scale = scale * (1.0 + 2.0 * float(padding))
+
+    uv_norm = (uv - center[:, None, :]) / scale[:, None, :] + 0.5
+    return uv_norm
+
+
+def make_grid_centers(grid_size: int, device, dtype):
+    """
+    return:
+        centers: [grid_size * grid_size, 2]，范围 [0, 1]
+    """
+    if grid_size <= 1:
+        raise ValueError(f"grid_size must be > 1, got {grid_size}")
+
+    t = torch.linspace(0.0, 1.0, grid_size, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(t, t, indexing="ij")
+    centers = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
+    return centers
+
+
+def soft_rasterize_uv_to_grid(
+    uv_norm: torch.Tensor,
+    grid_size: int = 64,
+    sigma: float = 1.0,
+    chunk_size: int = 1024,
+):
+    """
+    CUDA/Tensor soft rasterization，不做 CPU numpy，不用逐点 Python 画图。
+
+    uv_norm: [B, N, 2]，归一化后的投影坐标。
+
+    return:
+        occ: [B, 1, grid_size, grid_size]，soft occupancy map，范围 [0, 1]
+
+    说明：
+    - 每个投影点用一个高斯核 splat 到 64x64 grid；
+    - occ = 1 - exp(-sum(weight))，多个点落入同一格不会无限增大；
+    - pred 分支对 uv_norm 可导，因此 loss 能反传到 pred_points。
+    """
+    B, N, _ = uv_norm.shape
+    device = uv_norm.device
+    dtype = uv_norm.dtype
+
+    centers = make_grid_centers(grid_size, device=device, dtype=dtype)  # [P, 2]
+    P = centers.shape[0]
+
+    # sigma 用“像素”为单位；sigma=1.0 约等于一个 grid cell 宽度。
+    sigma_norm = float(sigma) / float(grid_size - 1)
+    denom = 2.0 * sigma_norm * sigma_norm
+
+    weight_sum = uv_norm.new_zeros((B, P))
+    chunk_size = int(chunk_size) if chunk_size is not None and chunk_size > 0 else N
+
+    for start in range(0, N, chunk_size):
+        cur = uv_norm[:, start:start + chunk_size, :]  # [B, C, 2]
+        dist2 = ((cur[:, :, None, :] - centers[None, None, :, :]) ** 2).sum(dim=-1)  # [B, C, P]
+        weight_sum = weight_sum + torch.exp(-dist2 / denom).sum(dim=1)               # [B, P]
+
+    occ = 1.0 - torch.exp(-weight_sum)
+    return occ.view(B, 1, grid_size, grid_size)
+
+
+def weighted_grid_loss(
+    pred_occ: torch.Tensor,
+    gt_occ: torch.Tensor,
+    pos_weight: float = 4.0,
+    use_smooth_l1: bool = True,
+    eps: float = 1e-6,
+):
+    """
+    pred_occ / gt_occ: [B, 1, G, G]
+
+    正样本 grid 通常比背景少，所以对 GT 前景区域加权，避免全背景把 loss 稀释掉。
+    """
+    gt_occ = gt_occ.detach()
+
+    if use_smooth_l1:
+        loss_map = F.smooth_l1_loss(pred_occ, gt_occ, reduction="none")
     else:
-        offset = torch.zeros((), device=device, dtype=dtype)
+        loss_map = (pred_occ - gt_occ) ** 2
 
-    idx = torch.arange(num_dirs, device=device, dtype=dtype)
-    theta = idx / num_dirs * (2.0 * math.pi) + offset
-
-    dirs = torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)  # [D, 2]
-    return dirs
-
-
-def gather_support_points(uv: torch.Tensor, dirs: torch.Tensor):
-    """
-    uv:   [B, N, 2]
-    dirs: [D, 2]
-
-    return:
-        support_points: [B, D, 2]
-        support_values: [B, D]
-        support_indices: [B, D]
-    """
-    # 用 detach 选支撑点，避免 argmax 选择过程参与梯度
-    scores_detached = torch.matmul(uv.detach(), dirs.t())  # [B, N, D]
-    support_indices = torch.argmax(scores_detached, dim=1)  # [B, D]
-
-    gather_idx = support_indices.unsqueeze(-1).expand(-1, -1, 2)  # [B, D, 2]
-    support_points = torch.gather(uv, dim=1, index=gather_idx)     # [B, D, 2]
-
-    # 注意这里用没有 detach 的 support_points，保证 pred_points 有梯度
-    support_values = (support_points * dirs[None, :, :]).sum(dim=-1)  # [B, D]
-
-    return support_points, support_values, support_indices
-
-
-def batch_chamfer_2d(a: torch.Tensor, b: torch.Tensor, squared: bool = True):
-    """
-    a: [B, Na, 2]
-    b: [B, Nb, 2]
-
-    return:
-        scalar
-    """
-    dist = torch.cdist(a, b, p=2)  # [B, Na, Nb]
-
-    if squared:
-        dist = dist ** 2
-
-    a2b = dist.min(dim=2)[0].mean(dim=1)  # [B]
-    b2a = dist.min(dim=1)[0].mean(dim=1)  # [B]
-
-    return (a2b + b2a).mean()
+    weight = 1.0 + float(pos_weight) * gt_occ
+    return (loss_map * weight).sum() / (weight.sum() + eps)
 
 
 class LightProjectionEdgeLoss(nn.Module):
     """
-    Support-Direction Projection Edge Loss.
+    Grid Projection Edge/Occupancy Loss.
 
-    核心思想：
-    对每个光线方向，把点云投影到垂直光线的 2D 平面；
-    在 2D 平面中设置多个外法线方向；
-    每个方向只选最外侧支撑点；
-    约束 pred 支撑点 / 支撑值 与 gt 一致。
+    改动点：
+    旧版本是 support-direction：每个方向只选 1 个最外侧支撑点；
+    新版本是 grid：把点云沿光线方向投影到垂直光线的 2D 平面，
+    再 soft rasterize 成 64x64 occupancy grid，比较 pred / gt 的投影 grid。
+
+    这样同一条直线/同一段轮廓上的多个边界点可以同时进入 loss，
+    不会被“一个方向一个 argmax 点”压缩掉。
 
     pred_points: [B, N, 3]
     gt_points:   [B, M, 3]
@@ -136,19 +251,36 @@ class LightProjectionEdgeLoss(nn.Module):
         random_frames: bool = True,
         random_rotate_dirs: bool = True,
         support_weight: float = 1.0,
-        chamfer_weight: float = 0.5,
+        chamfer_weight: float = 0.0,
         use_smooth_l1: bool = True,
+        grid_size: Optional[int] = None,
+        grid_padding: float = 0.05,
+        grid_sigma: float = 1.0,
+        grid_chunk_size: int = 1024,
+        grid_pos_weight: float = 4.0,
     ):
         super().__init__()
+
+        # 兼容旧配置：如果 train.py/yaml 还传 num_dirs，就把 num_dirs 当成 grid_size。
         self.num_dirs = num_dirs
+        self.grid_size = int(grid_size if grid_size is not None else num_dirs)
+
+        # squared / random_rotate_dirs / chamfer_weight 保留是为了兼容旧 train.py 和旧 yaml。
+        # 新 grid loss 不再使用方向旋转，也不再使用 support point chamfer。
         self.squared = squared
+        self.random_rotate_dirs = random_rotate_dirs
+        self.chamfer_weight = chamfer_weight
+
         self.max_frames = max_frames
         self.frame_stride = frame_stride
         self.random_frames = random_frames
-        self.random_rotate_dirs = random_rotate_dirs
-        self.support_weight = support_weight
-        self.chamfer_weight = chamfer_weight
+        self.grid_weight = support_weight
         self.use_smooth_l1 = use_smooth_l1
+
+        self.grid_padding = float(grid_padding)
+        self.grid_sigma = float(grid_sigma)
+        self.grid_chunk_size = int(grid_chunk_size)
+        self.grid_pos_weight = float(grid_pos_weight)
 
     def select_frame_ids(self, K: int, device):
         """
@@ -168,71 +300,50 @@ class LightProjectionEdgeLoss(nn.Module):
 
         return frame_ids
 
-    def forward(
-        self,
-        pred_points: torch.Tensor,
-        gt_points: torch.Tensor,
-        light_dir: torch.Tensor,
-    ):
+    def forward(self, pred_points, gt_points, light_dir):
         if light_dir.dim() == 2:
             light_dir = light_dir[:, None, :]
-
-        B, K, _ = light_dir.shape
+        _, K, _ = light_dir.shape
         device = pred_points.device
-        dtype = pred_points.dtype
 
         frame_ids = self.select_frame_ids(K, device=device)
-
-        dirs = make_support_dirs(
-            num_dirs=self.num_dirs,
-            device=device,
-            dtype=dtype,
-            random_rotate=(self.training and self.random_rotate_dirs),
-        )  # [D, 2]
-
         total_loss = pred_points.new_tensor(0.0)
-        valid_count = 0
 
-        for k_tensor in frame_ids:
-            k = int(k_tensor.item())
-            cur_light = light_dir[:, k, :]  # [B, 3]
+        for frame_pos in range(frame_ids.numel()):
+            k_tensor = frame_ids[frame_pos:frame_pos + 1]
+            cur_light = light_dir.index_select(dim=1, index=k_tensor).squeeze(1)
 
-            uv_pred = project_to_light_plane(pred_points, cur_light)  # [B, N, 2]
-            uv_gt = project_to_light_plane(gt_points, cur_light)      # [B, M, 2]
+            uv_pred = project_to_light_plane(pred_points, cur_light)
+            uv_gt = project_to_light_plane(gt_points, cur_light)
 
-            pred_support_pts, pred_support_values, _ = gather_support_points(uv_pred, dirs)
-            gt_support_pts, gt_support_values, _ = gather_support_points(uv_gt, dirs)
+            uv_pred_norm = normalize_uv_by_gt_box(uv_pred, uv_gt, padding=self.grid_padding)
+            uv_gt_norm = normalize_uv_by_gt_box(uv_gt, uv_gt, padding=self.grid_padding)
 
-            # 1. 支撑值一致：每个方向的最外轮廓范围一致
-            if self.use_smooth_l1:
-                loss_support = F.smooth_l1_loss(
-                    pred_support_values,
-                    gt_support_values.detach(),
-                    reduction="mean",
+            # GT occupancy & 边界图（no_grad，只做监督）
+            with torch.no_grad():
+                gt_occ = soft_rasterize_uv_to_grid(
+                    uv_gt_norm, self.grid_size, self.grid_sigma, self.grid_chunk_size
                 )
-            else:
-                loss_support = F.mse_loss(
-                    pred_support_values,
-                    gt_support_values.detach(),
-                    reduction="mean",
-                )
+                boundary_map = compute_soft_boundary_map(gt_occ)  # [B,1,G,G]
 
-            # 2. 支撑点位置一致：允许局部轮廓点集匹配
-            loss_chamfer = batch_chamfer_2d(
-                pred_support_pts,
-                gt_support_pts.detach(),
-                squared=self.squared,
+            # per-point 边界权重（grid_sample 可微）
+            w = sample_boundary_weight_per_point(uv_pred_norm, boundary_map)  # [B,N]
+
+            # 加权 CD（边界聚焦，梯度连续）
+            loss_cd = weighted_chamfer_2d(uv_pred_norm, uv_gt_norm, w)
+
+            # 保留一个小权重的全局 grid loss 做正则（防止 pred 完全坍缩）
+            pred_occ = soft_rasterize_uv_to_grid(
+                uv_pred_norm, self.grid_size, self.grid_sigma, self.grid_chunk_size
+            )
+            loss_grid = weighted_grid_loss(
+                pred_occ, gt_occ,
+                pos_weight=self.grid_pos_weight,
+                use_smooth_l1=self.use_smooth_l1,
             )
 
-            loss = (
-                self.support_weight * loss_support
-                + self.chamfer_weight * loss_chamfer
-            )
+            # sum 不 mean，每帧独立约束
+            total_loss = total_loss + self.grid_weight * loss_cd + 0.1 * loss_grid
 
-            total_loss = total_loss + loss
-            valid_count += 1
-
-        if valid_count == 0:
-            return pred_points.new_tensor(0.0)
-
-        return total_loss / valid_count
+        # 直接除帧数做归一化（不乘 run_every_batch）
+        return total_loss / max(frame_ids.numel(), 1)
