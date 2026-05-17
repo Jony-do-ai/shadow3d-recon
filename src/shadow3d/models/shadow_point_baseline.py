@@ -94,20 +94,6 @@ class PointCloudDecoder(nn.Module):
         return x                                # [B, num_points, 3]
 
 class SimpleTransformerRefiner(nn.Module):
-    """
-    最简单的 Transformer Refiner：纯几何细化，不注入 global_feat。
-
-    coarse_points 已经编码了 10 帧阴影信息（通过 decoder 从 global_feat 解出来），
-    所以 refiner 只需要让每个点感知其他点的位置，预测自己的位移。
-
-    结构:
-        coarse_points [B, N, 3]
-            → Linear(3 → hidden_dim)
-            → TransformerEncoderLayer × num_blocks  （全局自注意力）
-            → Linear(hidden_dim → 3)
-            → tanh × delta_scale
-            → coarse_points + delta
-    """
     def __init__(
         self,
         hidden_dim: int = 128,
@@ -115,18 +101,26 @@ class SimpleTransformerRefiner(nn.Module):
         num_heads: int = 4,
         delta_scale: float = 0.05,
         dropout: float = 0.0,
+        cond_dim: Optional[int] = None,   # 新增:global_feat 的维度
     ):
         super().__init__()
         self.delta_scale = delta_scale
+        self.use_cond = cond_dim is not None   # 新增:是否使用条件注入
 
-        # 坐标嵌入：3D 坐标 → 高维特征
         self.coord_embed = nn.Sequential(
             nn.Linear(3, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # 标准 Transformer Encoder（batch_first=True 让输入是 [B, N, C]）
+        # 新增:把 global_feat 投影到 hidden_dim,作为每个 token 的 condition
+        if self.use_cond:
+            self.cond_proj = nn.Sequential(
+                nn.Linear(cond_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -134,34 +128,39 @@ class SimpleTransformerRefiner(nn.Module):
             dropout=dropout,
             activation="relu",
             batch_first=True,
-            norm_first=True,   # Pre-LN，训练更稳定
+            norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
             num_layers=num_blocks,
         )
 
-        # 位移头：特征 → 3D 位移
         self.delta_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 3),
         )
 
-        # 关键：让 refiner 初始时接近 identity，不要一开始就把点云拉乱
         nn.init.zeros_(self.delta_head[-1].weight)
         nn.init.zeros_(self.delta_head[-1].bias)
 
-    def forward(self, coarse_points: torch.Tensor) -> torch.Tensor:
-        """
-        coarse_points: [B, N, 3]
-        return:        [B, N, 3]
-        """
+    def forward(
+        self,
+        coarse_points: torch.Tensor,
+        global_feat: Optional[torch.Tensor] = None,   # 新增参数
+    ) -> torch.Tensor:
         feat = self.coord_embed(coarse_points)        # [B, N, hidden_dim]
-        feat = self.transformer(feat)                 # [B, N, hidden_dim]
-        delta = self.delta_head(feat)                 # [B, N, 3]
-        delta = self.delta_scale * torch.tanh(delta)  # 限幅
-        return coarse_points + delta                  # 残差
+
+        # 新增:把 global_feat 广播加到每个点的特征上
+        if self.use_cond:
+            assert global_feat is not None, "use_cond=True 时必须传 global_feat"
+            cond = self.cond_proj(global_feat)        # [B, hidden_dim]
+            feat = feat + cond.unsqueeze(1)           # [B, N, hidden_dim],广播到 N 个点
+
+        feat = self.transformer(feat)
+        delta = self.delta_head(feat)
+        delta = self.delta_scale * torch.tanh(delta)
+        return coarse_points + delta
 
 
 class ShadowPointBaseline(nn.Module):
@@ -207,6 +206,7 @@ class ShadowPointBaseline(nn.Module):
                 num_blocks=refiner_blocks,
                 num_heads=refiner_num_heads,
                 delta_scale=refiner_delta_scale,
+                cond_dim=self.global_dim,   # 控制是否注入
             )
         else:
             self.refiner = None
@@ -234,6 +234,7 @@ class ShadowPointBaseline(nn.Module):
         if self.refiner is None:
             return coarse_points
 
-        refined_points = self.refiner(coarse_points)   # 不再传 global_feat
+        # 修改:把 global_feat 传进去(refiner 内部会根据 use_cond 决定用不用)
+        refined_points = self.refiner(coarse_points, global_feat=global_feat)
         return refined_points
 
