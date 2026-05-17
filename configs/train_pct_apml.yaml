@@ -23,16 +23,12 @@ model:
   fused_dim: 256
   num_points: 2048
 
-  # PCT Refiner 开关与配置
-  use_pct_refiner: false
-  pct_hidden_dim: 128
-  pct_coord_dim: 64
-  pct_shadow_dim: 128
-  pct_blocks: 4
-  pct_knn_k: 16
-  pct_delta_scale: 0.01
-  pct_qk_dim: 32
-  pct_use_condition: true
+  # Simple Transformer Refiner 开关与配置
+  use_refiner: false
+  refiner_hidden_dim: 128
+  refiner_blocks: 2
+  refiner_num_heads: 4
+  refiner_delta_scale: 0.05
 
 loss:
   point_loss_type: apml
@@ -49,7 +45,7 @@ loss:
   bbox: 0.0
   bbox_radius: 1.0
 
-  # 先只开 PCT 时，可以把 hd/repulsion 设 0。
+  # 先只开 refiner  时，可以把 hd/repulsion 设 0。
   # 确认稳定后再逐步打开。
   hd: 0.00
   hd_top_ratio: 0.1
@@ -63,6 +59,6 @@ optim:
   epochs: 100
 
 log:
-  out_dir: data/train_runs/apml-nopct
+  out_dir: data/train_runs/cnn-apml
   print_every: 10
   save_every_epoch: 10
