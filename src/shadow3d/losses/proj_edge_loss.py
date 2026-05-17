@@ -258,8 +258,10 @@ class LightProjectionEdgeLoss(nn.Module):
         grid_sigma: float = 1.0,
         grid_chunk_size: int = 1024,
         grid_pos_weight: float = 4.0,
+        use_grid_loss: bool = True,
     ):
         super().__init__()
+        self.use_grid_loss = bool(use_grid_loss)
 
         # 兼容旧配置：如果 train.py/yaml 还传 num_dirs，就把 num_dirs 当成 grid_size。
         self.num_dirs = num_dirs
@@ -300,7 +302,7 @@ class LightProjectionEdgeLoss(nn.Module):
 
         return frame_ids
 
-    def forward(self, pred_points, gt_points, light_dir):
+    def forward(self, pred_points, gt_points, light_dir, return_stats: bool = False):
         if light_dir.dim() == 2:
             light_dir = light_dir[:, None, :]
         _, K, _ = light_dir.shape
@@ -308,6 +310,15 @@ class LightProjectionEdgeLoss(nn.Module):
 
         frame_ids = self.select_frame_ids(K, device=device)
         total_loss = pred_points.new_tensor(0.0)
+
+        # === 诊断统计累加器（不参与反传） ===
+        stat_loss_cd_sum = 0.0      # 加权 2D chamfer 总和
+        stat_loss_grid_sum = 0.0    # grid loss 总和
+        stat_p2g_sum = 0.0          # pred->gt 那一支
+        stat_g2p_sum = 0.0          # gt->pred 那一支
+        stat_w_mean_sum = 0.0       # 每个 pred 点的边界权重平均
+        stat_w_active_sum = 0.0     # 权重 > 0.05 的 pred 点占比
+        stat_uv_inside_sum = 0.0    # uv_pred_norm 落在 [0,1] 内的点占比
 
         for frame_pos in range(frame_ids.numel()):
             k_tensor = frame_ids[frame_pos:frame_pos + 1]
@@ -328,22 +339,72 @@ class LightProjectionEdgeLoss(nn.Module):
 
             # per-point 边界权重（grid_sample 可微）
             w = sample_boundary_weight_per_point(uv_pred_norm, boundary_map)  # [B,N]
-
-            # 加权 CD（边界聚焦，梯度连续）
-            loss_cd = weighted_chamfer_2d(uv_pred_norm, uv_gt_norm, w)
+            w = 0.3 + 0.7 * w  # base=0.3, 边界点权重 ≈ 1.0
+            # 加权 CD（边界聚焦，梯度连续）—— 用拆分版同时拿到 p2g/g2p
+            loss_cd, loss_p2g_val, loss_g2p_val = self._weighted_chamfer_2d_split(
+                uv_pred_norm, uv_gt_norm, w
+            )
 
             # 保留一个小权重的全局 grid loss 做正则（防止 pred 完全坍缩）
-            pred_occ = soft_rasterize_uv_to_grid(
-                uv_pred_norm, self.grid_size, self.grid_sigma, self.grid_chunk_size
-            )
-            loss_grid = weighted_grid_loss(
-                pred_occ, gt_occ,
-                pos_weight=self.grid_pos_weight,
-                use_smooth_l1=self.use_smooth_l1,
-            )
+            # use_grid_loss=False 时跳过 pred 端 rasterize（最贵的一步，因为有 grad）
+            if self.use_grid_loss:
+                pred_occ = soft_rasterize_uv_to_grid(
+                    uv_pred_norm, self.grid_size, self.grid_sigma, self.grid_chunk_size
+                )
+                loss_grid = weighted_grid_loss(
+                    pred_occ, gt_occ,
+                    pos_weight=self.grid_pos_weight,
+                    use_smooth_l1=self.use_smooth_l1,
+                )
+                total_loss = total_loss + self.grid_weight * loss_cd + 0.1 * loss_grid
+            else:
+                loss_grid = total_loss.new_tensor(0.0)
+                total_loss = total_loss + self.grid_weight * loss_cd
 
-            # sum 不 mean，每帧独立约束
-            total_loss = total_loss + self.grid_weight * loss_cd + 0.1 * loss_grid
+            # === 诊断统计（detach 防止参与反传） ===
+            with torch.no_grad():
+                stat_loss_cd_sum += float(loss_cd.detach())
+                stat_loss_grid_sum += float(loss_grid.detach())
+                stat_p2g_sum += float(loss_p2g_val.detach())
+                stat_g2p_sum += float(loss_g2p_val.detach())
+                stat_w_mean_sum += float(w.mean().detach())
+                stat_w_active_sum += float((w > 0.05).float().mean().detach())
+                inside = ((uv_pred_norm >= 0.0) & (uv_pred_norm <= 1.0)).all(dim=-1).float()
+                stat_uv_inside_sum += float(inside.mean().detach())
 
+        n_frames = max(frame_ids.numel(), 1)
         # 直接除帧数做归一化（不乘 run_every_batch）
-        return total_loss / max(frame_ids.numel(), 1)
+        out_loss = total_loss / n_frames
+
+        if not return_stats:
+            return out_loss
+
+        stats = {
+            "proj_loss_raw": float(out_loss.detach()),
+            "proj_loss_cd_2d": stat_loss_cd_sum / n_frames,         # 加权 2D chamfer
+            "proj_loss_grid": stat_loss_grid_sum / n_frames,        # grid 监督
+            "proj_loss_p2g": stat_p2g_sum / n_frames,               # pred->gt
+            "proj_loss_g2p": stat_g2p_sum / n_frames,               # gt->pred
+            "proj_w_mean": stat_w_mean_sum / n_frames,              # 平均边界权重
+            "proj_w_active_ratio": stat_w_active_sum / n_frames,    # 有效梯度点占比
+            "proj_uv_inside_ratio": stat_uv_inside_sum / n_frames,  # 投影点落在 grid 内占比
+            "proj_n_frames": n_frames,
+        }
+        return out_loss, stats
+
+    @staticmethod
+    def _weighted_chamfer_2d_split(uv_pred, uv_gt, weights, eps: float = 1e-8):
+        """
+        和 weighted_chamfer_2d 完全等价，但额外返回 p2g 和 g2p 两支用于诊断。
+        """
+        dist = torch.cdist(uv_pred, uv_gt)  # [B, N, M]
+
+        min_p2g, _ = dist.min(dim=-1)
+        w_sum = weights.sum(dim=-1).clamp(min=eps)
+        loss_p2g = (weights * min_p2g ** 2).sum(dim=-1) / w_sum
+
+        min_g2p, _ = dist.min(dim=-2)
+        loss_g2p = min_g2p.pow(2).mean(dim=-1)
+
+        total = (loss_p2g + loss_g2p).mean()
+        return total, loss_p2g.mean(), loss_g2p.mean()

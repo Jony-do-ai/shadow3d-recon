@@ -108,6 +108,39 @@ def save_checkpoint(model, optimizer, step, out_path):
     }
     torch.save(ckpt, out_path)
 
+
+def load_checkpoint(model, optimizer, ckpt_path, device, load_optimizer: bool = True):
+    """
+    从 ckpt 恢复 model 和 optimizer。
+    返回 ckpt 里保存的 epoch（即上次训练结束时已完成的 epoch 号）。
+    新训练应该从 last_epoch + 1 开始。
+    """
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Resume ckpt not found: {ckpt_path}")
+
+    print(f"[RESUME] Loading checkpoint from: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    # 兼容 strict=False，防止后续模型有小改动时直接挂掉
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    if missing:
+        print(f"[RESUME][WARN] Missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+    if unexpected:
+        print(f"[RESUME][WARN] Unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+
+    if load_optimizer and "optimizer" in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            print(f"[RESUME] Optimizer state restored.")
+        except Exception as e:
+            print(f"[RESUME][WARN] Failed to load optimizer state: {e}. Using fresh optimizer.")
+    else:
+        print(f"[RESUME] Skipping optimizer state (load_optimizer={load_optimizer}).")
+
+    last_epoch = int(ckpt.get("step", 0))
+    print(f"[RESUME] Last completed epoch in ckpt: {last_epoch}. Training will continue from epoch {last_epoch + 1}.")
+    return last_epoch
+
 def format_seconds(seconds: float) -> str:
     """
     将秒数格式化为 h m s，方便打印训练用时。
@@ -144,6 +177,17 @@ def init_train_log(log_path: str):
         "loss_bbox",
         "loss_hd",
         "loss_repulsion",
+
+        # === proj_edge 诊断 ===
+        "proj_loss_raw",
+        "proj_loss_cd_2d",
+        "proj_loss_grid",
+        "proj_loss_p2g",
+        "proj_loss_g2p",
+        "proj_w_mean",
+        "proj_w_active_ratio",
+        "proj_uv_inside_ratio",
+        "proj_grad_ratio",   # ||grad_proj|| / ||grad_cd||
 
         "precision_0_01",
         "recall_0_01",
@@ -190,6 +234,17 @@ def append_train_log(
         "loss_bbox": float(stats["loss_bbox"]),
         "loss_hd": float(stats.get("loss_hd", 0.0)),
         "loss_repulsion": float(stats.get("loss_repulsion", 0.0)),
+
+        # === proj_edge 诊断 ===
+        "proj_loss_raw": float(stats.get("proj_loss_raw", 0.0)),
+        "proj_loss_cd_2d": float(stats.get("proj_loss_cd_2d", 0.0)),
+        "proj_loss_grid": float(stats.get("proj_loss_grid", 0.0)),
+        "proj_loss_p2g": float(stats.get("proj_loss_p2g", 0.0)),
+        "proj_loss_g2p": float(stats.get("proj_loss_g2p", 0.0)),
+        "proj_w_mean": float(stats.get("proj_w_mean", 0.0)),
+        "proj_w_active_ratio": float(stats.get("proj_w_active_ratio", 0.0)),
+        "proj_uv_inside_ratio": float(stats.get("proj_uv_inside_ratio", 0.0)),
+        "proj_grad_ratio": float(stats.get("proj_grad_ratio", 0.0)),
 
         "precision_0_01": float(stats["precision_0_01"]),
         "recall_0_01": float(stats["recall_0_01"]),
@@ -283,8 +338,28 @@ def compute_point_loss_dict(
 def train_one_epoch(model, loader, optimizer, device,
                     loss_cfg, epoch_idx, global_step,
                     log_every=10, save_ply_every=5, out_dir=None,
-                    use_light=True,apml_criterion=None,proj_edge_loss_fn=None, proj_edge_weight=0.0,proj_edge_run_every_batch=1,):
+                    use_light=True,apml_criterion=None,proj_edge_loss_fn=None, proj_edge_weight=0.0,proj_edge_run_every_batch=1,
+                    proj_edge_start_epoch=1, proj_edge_warmup_epochs=0,):
     model.train()
+
+    # === 计算本 epoch 的 effective_weight（支持 start_epoch + 线性 warmup） ===
+    if epoch_idx < proj_edge_start_epoch:
+        proj_edge_effective_weight = 0.0
+    elif proj_edge_warmup_epochs > 0 and epoch_idx < proj_edge_start_epoch + proj_edge_warmup_epochs:
+        # 线性 ramp：start_epoch 时 progress=0（仍为 0），start_epoch+warmup 时 progress=1
+        progress = (epoch_idx - proj_edge_start_epoch + 1) / float(proj_edge_warmup_epochs)
+        progress = min(max(progress, 0.0), 1.0)
+        proj_edge_effective_weight = proj_edge_weight * progress
+    else:
+        proj_edge_effective_weight = proj_edge_weight
+
+    if proj_edge_loss_fn is not None and proj_edge_weight > 0.0:
+        print(
+            f"[INFO] epoch {epoch_idx}: proj_edge effective_weight = "
+            f"{proj_edge_effective_weight:.6f} (raw={proj_edge_weight}, "
+            f"start={proj_edge_start_epoch}, warmup={proj_edge_warmup_epochs})"
+        )
+
     running = {
         "loss_total": 0.0,
         "loss_cd": 0.0,
@@ -296,6 +371,18 @@ def train_one_epoch(model, loader, optimizer, device,
         "loss_bbox": 0.0,
         "loss_hd": 0.0,
         "loss_repulsion": 0.0,
+
+        # === proj_edge 诊断 ===
+        "proj_loss_raw": 0.0,
+        "proj_loss_cd_2d": 0.0,
+        "proj_loss_grid": 0.0,
+        "proj_loss_p2g": 0.0,
+        "proj_loss_g2p": 0.0,
+        "proj_w_mean": 0.0,
+        "proj_w_active_ratio": 0.0,
+        "proj_uv_inside_ratio": 0.0,
+        "proj_grad_ratio": 0.0,
+        "_proj_count": 0.0,  # 实际跑了 proj_edge 的 batch 数，最后做除法
 
         "precision_0_01": 0.0,
         "recall_0_01": 0.0,
@@ -335,25 +422,64 @@ def train_one_epoch(model, loader, optimizer, device,
 
         use_proj_edge_this_batch = (
                 proj_edge_loss_fn is not None
-                and proj_edge_weight > 0.0
+                and proj_edge_effective_weight > 0.0
                 and use_light
                 and proj_edge_run_every_batch > 0
                 and (batch_idx % proj_edge_run_every_batch == 0)
         )
 
         if use_proj_edge_this_batch:
-            loss_proj_edge = proj_edge_loss_fn(
+            # 拿到 raw loss 和细分 stats
+            loss_proj_edge, proj_stats = proj_edge_loss_fn(
                 pred_points=pred_points,
                 gt_points=points_gt,
                 light_dir=light_dir,
+                return_stats=True,
             )
 
-            # 因为不是每个 batch 都算，所以这里乘 run_every_batch，
-            # 让平均梯度强度大致接近“每 batch 都算”的情况。
+            # === 梯度诊断：分别看 cd 主项和 proj_edge 项对 pred_points 的梯度量级 ===
+            # 注意：这里调用 autograd.grad 不释放图（retain_graph=True），
+            # 也不参与反传（只读梯度做对比）。
+            try:
+                cd_grad_src = loss_dict.get("loss_cd", None)
+                if cd_grad_src is not None and cd_grad_src.requires_grad:
+                    g_cd = torch.autograd.grad(
+                        cd_grad_src, pred_points,
+                        retain_graph=True, create_graph=False, allow_unused=True,
+                    )[0]
+                    g_pe = torch.autograd.grad(
+                        loss_proj_edge, pred_points,
+                        retain_graph=True, create_graph=False, allow_unused=True,
+                    )[0]
+                    if g_cd is not None and g_pe is not None:
+                        n_cd = float(g_cd.detach().norm().item())
+                        n_pe = float(g_pe.detach().norm().item())
+                        # 用 effective_weight 反映实际参与优化的强度
+                        n_pe_weighted = n_pe * float(proj_edge_effective_weight)
+                        proj_stats["proj_grad_ratio"] = (
+                            n_pe_weighted / max(n_cd, 1e-12)
+                        )
+                    else:
+                        proj_stats["proj_grad_ratio"] = 0.0
+                else:
+                    proj_stats["proj_grad_ratio"] = 0.0
+            except Exception as e:
+                # 防御性：grad 诊断失败不阻断训练
+                proj_stats["proj_grad_ratio"] = 0.0
+
+            # 用 effective_weight 加权进入总 loss
             loss_dict["loss_total"] = (
                     loss_dict["loss_total"]
-                    + proj_edge_weight * loss_proj_edge
+                    + proj_edge_effective_weight * loss_proj_edge
             )
+
+            # 累加诊断 stats（只在跑了 proj_edge 的 batch 上累加）
+            for sk in ["proj_loss_raw", "proj_loss_cd_2d", "proj_loss_grid",
+                       "proj_loss_p2g", "proj_loss_g2p", "proj_w_mean",
+                       "proj_w_active_ratio", "proj_uv_inside_ratio",
+                       "proj_grad_ratio"]:
+                running[sk] += float(proj_stats.get(sk, 0.0))
+            running["_proj_count"] += 1.0
         else:
             loss_dict["loss_total"] = loss_dict["loss_total"]
 
@@ -364,7 +490,15 @@ def train_one_epoch(model, loader, optimizer, device,
         loss.backward()
         optimizer.step()
 
+        # 注意：proj_* 字段已在 use_proj_edge_this_batch 分支里手动累加，
+        # 这里只累加非诊断字段。
+        _proj_keys = {"proj_loss_raw", "proj_loss_cd_2d", "proj_loss_grid",
+                      "proj_loss_p2g", "proj_loss_g2p", "proj_w_mean",
+                      "proj_w_active_ratio", "proj_uv_inside_ratio",
+                      "proj_grad_ratio", "_proj_count"}
         for k in running.keys():
+            if k in _proj_keys:
+                continue
             running[k] += float(loss_dict[k].detach().cpu().item())
 
         global_step += 1
@@ -397,7 +531,17 @@ def train_one_epoch(model, loader, optimizer, device,
             )
 
     num_batches = max(len(loader), 1)
-    epoch_stats = {k: v / num_batches for k, v in running.items()}
+    proj_count = max(running.pop("_proj_count"), 1.0)
+    _proj_keys = {"proj_loss_raw", "proj_loss_cd_2d", "proj_loss_grid",
+                  "proj_loss_p2g", "proj_loss_g2p", "proj_w_mean",
+                  "proj_w_active_ratio", "proj_uv_inside_ratio",
+                  "proj_grad_ratio"}
+    epoch_stats = {}
+    for k, v in running.items():
+        if k in _proj_keys:
+            epoch_stats[k] = v / proj_count
+        else:
+            epoch_stats[k] = v / num_batches
     return global_step, epoch_stats
 
 def build_first_sample_per_category(dataset, max_categories=None):
@@ -571,6 +715,32 @@ def main():
     num_epochs = int(optim_cfg.get("epochs", 50))
 
     # -------------------------
+    # resume
+    # -------------------------
+    resume_from = optim_cfg.get("resume_from", None)
+    resume_load_optimizer = bool(optim_cfg.get("resume_load_optimizer", True))
+    start_epoch = 1  # 默认从 epoch 1 开始
+
+    if resume_from is not None and str(resume_from).strip() != "":
+        last_epoch = load_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            ckpt_path=str(resume_from),
+            device=device,
+            load_optimizer=resume_load_optimizer,
+        )
+        start_epoch = last_epoch + 1
+
+        if start_epoch > num_epochs:
+            raise ValueError(
+                f"Resume failed: ckpt last_epoch={last_epoch}, but optim.epochs={num_epochs}. "
+                f"Nothing to train."
+            )
+        print(f"[RESUME] Training from epoch {start_epoch} to {num_epochs}.")
+    else:
+        print(f"[INFO] No resume_from set, training from scratch (epoch 1 to {num_epochs}).")
+
+    # -------------------------
     # log / save
     # -------------------------
     log_cfg = cfg["log"]
@@ -583,8 +753,12 @@ def main():
         yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
 
     train_log_path = os.path.join(out_dir, "train_log.csv")
-    init_train_log(train_log_path)
-    print(f"[INFO] Train log will be saved to: {train_log_path}")
+    # resume 时不重新初始化日志，避免覆盖之前的 epoch 记录
+    if start_epoch == 1 or not os.path.isfile(train_log_path):
+        init_train_log(train_log_path)
+        print(f"[INFO] Train log will be saved to: {train_log_path}")
+    else:
+        print(f"[INFO] Appending to existing train log: {train_log_path}")
 
     # -------------------------
     # train
@@ -596,6 +770,8 @@ def main():
     proj_edge_loss_fn = None
     proj_edge_weight = 0.0
     proj_edge_run_every_batch = 1
+    proj_edge_start_epoch = 1
+    proj_edge_warmup_epochs = 0
 
     if bool(proj_edge_cfg.get("enabled", False)):
         if not use_light:
@@ -603,6 +779,8 @@ def main():
         else:
             proj_edge_weight = float(proj_edge_cfg.get("weight", 0.01))
             proj_edge_run_every_batch = int(proj_edge_cfg.get("run_every_batch", 1))
+            proj_edge_start_epoch = int(proj_edge_cfg.get("start_epoch", 1))
+            proj_edge_warmup_epochs = int(proj_edge_cfg.get("warmup_epochs", 0))
 
             proj_edge_loss_fn = LightProjectionEdgeLoss(
                 # 兼容旧配置：num_dirs 仍可用；新逻辑里它等价于 grid_size。
@@ -612,6 +790,7 @@ def main():
                 grid_sigma=float(proj_edge_cfg.get("grid_sigma", 1.0)),
                 grid_chunk_size=int(proj_edge_cfg.get("grid_chunk_size", 1024)),
                 grid_pos_weight=float(proj_edge_cfg.get("grid_pos_weight", 4.0)),
+                use_grid_loss=bool(proj_edge_cfg.get("use_grid_loss", True)),
 
                 squared=bool(proj_edge_cfg.get("squared", True)),
                 max_frames=int(proj_edge_cfg.get("max_frames", 1)),
@@ -626,7 +805,10 @@ def main():
             print(
                 f"[INFO] proj_edge grid enabled: "
                 f"weight={proj_edge_weight}, "
+                f"start_epoch={proj_edge_start_epoch}, "
+                f"warmup_epochs={proj_edge_warmup_epochs}, "
                 f"grid_size={proj_edge_cfg.get('grid_size', proj_edge_cfg.get('num_dirs', 64))}, "
+                f"use_grid_loss={proj_edge_cfg.get('use_grid_loss', True)}, "
                 f"grid_padding={proj_edge_cfg.get('grid_padding', 0.05)}, "
                 f"grid_sigma={proj_edge_cfg.get('grid_sigma', 1.0)}, "
                 f"grid_chunk_size={proj_edge_cfg.get('grid_chunk_size', 1024)}, "
@@ -671,7 +853,7 @@ def main():
 
     train_start_time = time.time()
 
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(start_epoch, num_epochs + 1):
         epoch_start_time = time.time()
 
         global_step, stats = train_one_epoch(
@@ -690,6 +872,8 @@ def main():
             proj_edge_loss_fn=proj_edge_loss_fn,
             proj_edge_weight=proj_edge_weight,
             proj_edge_run_every_batch=proj_edge_run_every_batch,
+            proj_edge_start_epoch=proj_edge_start_epoch,
+            proj_edge_warmup_epochs=proj_edge_warmup_epochs,
         )
         # 每个 epoch 都计算训练耗时
         epoch_time_sec = time.time() - epoch_start_time
@@ -716,6 +900,16 @@ def main():
             f"bbox={stats['loss_bbox']:.6f}, "
             f"hd={stats.get('loss_hd', 0.0):.6f}, "
             f"rep={stats.get('loss_repulsion', 0.0):.6f}, "
+            # === proj_edge 诊断 ===
+            f"[pe_raw={stats.get('proj_loss_raw', 0.0):.6f} "
+            f"pe_cd2d={stats.get('proj_loss_cd_2d', 0.0):.6f} "
+            f"pe_grid={stats.get('proj_loss_grid', 0.0):.6f} "
+            f"pe_p2g={stats.get('proj_loss_p2g', 0.0):.6f} "
+            f"pe_g2p={stats.get('proj_loss_g2p', 0.0):.6f} "
+            f"w_mean={stats.get('proj_w_mean', 0.0):.4f} "
+            f"w_act={stats.get('proj_w_active_ratio', 0.0):.3f} "
+            f"uv_in={stats.get('proj_uv_inside_ratio', 0.0):.3f} "
+            f"grad_ratio={stats.get('proj_grad_ratio', 0.0):.4f}], "
             f"epoch_time={format_seconds(epoch_time_sec)}, "
             f"elapsed={format_seconds(elapsed_sec)}, "
             f"eta={format_seconds(remaining_sec)}, "
