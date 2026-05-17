@@ -23,16 +23,11 @@ model:
   fused_dim: 256
   num_points: 2048
 
-  # PCT Refiner 开关与配置
-  use_pct_refiner: false
-  pct_hidden_dim: 128
-  pct_coord_dim: 64
-  pct_shadow_dim: 128
-  pct_blocks: 4
-  pct_knn_k: 16
-  pct_delta_scale: 0.05
-  pct_qk_dim: 32
-  pct_use_condition: true
+  use_refiner: false
+  refiner_hidden_dim: 128
+  refiner_blocks: 2
+  refiner_num_heads: 4
+  refiner_delta_scale: 0.05
 
 loss:
   cd: 1.0
@@ -54,6 +49,6 @@ optim:
   epochs: 100
 
 log:
-  out_dir: data/train_runs/base
+  out_dir: data/train_runs/cnn-cd
   print_every: 10
   save_every_epoch: 10

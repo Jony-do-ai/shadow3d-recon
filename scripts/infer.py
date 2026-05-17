@@ -57,9 +57,6 @@ def save_point_cloud_ply(points: torch.Tensor, ply_path: str) -> None:
 def build_model_from_config(cfg: Dict[str, Any], device: torch.device) -> ShadowPointBaseline:
     """
     按配置构建模型
-    这里兼容两种常见写法：
-    1) cfg["model"][...]
-    2) 顶层直接写 image_feat_dim / light_feat_dim / ...
     """
     model_cfg = cfg.get("model", {})
 
@@ -68,16 +65,12 @@ def build_model_from_config(cfg: Dict[str, Any], device: torch.device) -> Shadow
         light_feat_dim=int(model_cfg.get("light_feat_dim", 128)),
         fused_dim=int(model_cfg.get("fused_dim", 256)),
         num_points=int(model_cfg.get("num_points", 2048)),
-        use_pct_refiner=bool(model_cfg.get("use_pct_refiner", True)),
-        pct_hidden_dim=int(model_cfg.get("pct_hidden_dim", 128)),
-        pct_coord_dim=int(model_cfg.get("pct_coord_dim", 64)),
-        pct_shadow_dim=int(model_cfg.get("pct_shadow_dim", 128)),
-        pct_blocks=int(model_cfg.get("pct_blocks", 4)),
-        pct_knn_k=int(model_cfg.get("pct_knn_k", 16)),
-        pct_delta_scale=float(model_cfg.get("pct_delta_scale", 0.05)),
-        pct_qk_dim=model_cfg.get("pct_qk_dim", None),
-        pct_use_condition=bool(model_cfg.get("pct_use_condition", True)),
         num_frames=int(model_cfg.get("num_frames", 10)),
+        use_refiner=bool(model_cfg.get("use_refiner", True)),
+        refiner_hidden_dim=int(model_cfg.get("refiner_hidden_dim", 128)),
+        refiner_blocks=int(model_cfg.get("refiner_blocks", 2)),
+        refiner_num_heads=int(model_cfg.get("refiner_num_heads", 4)),
+        refiner_delta_scale=float(model_cfg.get("refiner_delta_scale", 0.05)),
     )
     model.to(device)
     return model
