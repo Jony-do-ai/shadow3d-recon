@@ -122,7 +122,7 @@ def format_seconds(seconds: float) -> str:
         return f"{m}m {s}s"
     return f"{s}s"
 
-def init_train_log(log_path: str):
+def init_train_log(log_path: str,resume: bool = False):
     """
     初始化 epoch 级训练日志。
     每一行记录一个 epoch 的平均 loss。
@@ -157,6 +157,10 @@ def init_train_log(log_path: str):
 
         "epoch_time_sec",
     ]
+
+    if resume and os.path.exists(log_path):
+        print(f"[INFO] Resume mode: append to existing log {log_path}")
+        return
 
     with open(log_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=header)
@@ -438,6 +442,13 @@ def save_fixed_category_predictions(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/train_no_light.yaml")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to a .pt checkpoint to resume training from. "
+             "Continues epoch numbering and appends to the existing train_log.csv.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -525,6 +536,25 @@ def main():
     num_epochs = int(optim_cfg.get("epochs", 50))
 
     # -------------------------
+    # resume from checkpoint (if any)
+    # -------------------------
+    start_epoch = 0  # 已完成的 epoch 数；下一个 epoch = start_epoch + 1
+    if args.resume is not None:
+        if not os.path.isfile(args.resume):
+            raise FileNotFoundError(f"--resume checkpoint not found: {args.resume}")
+        print(f"[INFO] Resuming from checkpoint: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = int(ckpt.get("step", 0))
+        print(f"[INFO] Resumed at epoch {start_epoch}, "
+              f"will continue from epoch {start_epoch + 1} to {num_epochs}")
+        if start_epoch >= num_epochs:
+            print(f"[WARN] start_epoch ({start_epoch}) >= num_epochs ({num_epochs}), "
+                  f"nothing to train.")
+
+
+    # -------------------------
     # log / save
     # -------------------------
     log_cfg = cfg["log"]
@@ -533,11 +563,14 @@ def main():
     ensure_dir(os.path.join(out_dir, "checkpoints"))
     ensure_dir(os.path.join(out_dir, "plots"))
 
-    with open(os.path.join(out_dir, "config_dump.yaml"), "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+    # resume 模式下不覆盖原 config_dump.yaml，保留原始训练记录
+    config_dump_path = os.path.join(out_dir, "config_dump.yaml")
+    if args.resume is None or not os.path.exists(config_dump_path):
+        with open(config_dump_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
 
     train_log_path = os.path.join(out_dir, "train_log.csv")
-    init_train_log(train_log_path)
+    init_train_log(train_log_path, resume=(args.resume is not None))
     print(f"[INFO] Train log will be saved to: {train_log_path}")
 
     # -------------------------
@@ -577,7 +610,7 @@ def main():
 
     train_start_time = time.time()
 
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(start_epoch + 1, num_epochs + 1):
         epoch_start_time = time.time()
 
         global_step, stats = train_one_epoch(
