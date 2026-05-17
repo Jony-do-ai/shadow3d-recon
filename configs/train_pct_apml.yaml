@@ -23,6 +23,8 @@ model:
   fused_dim: 256
   num_points: 2048
 
+  frame_agg_mode: mean       # 新增,默认 'mean',attn
+  refiner_use_cond: true     # 新增,默认 true
   # Simple Transformer Refiner 开关与配置
   use_refiner: true
   refiner_hidden_dim: 128
@@ -59,6 +61,6 @@ optim:
   epochs: 100
 
 log:
-  out_dir: data/train_runs/cnn-transformer-apml
+  out_dir: data/train_runs/transformer-cnn-apmlcd
   print_every: 10
   save_every_epoch: 10
