@@ -1,7 +1,7 @@
 训练：在根目录执行
 python scripts/train.py --config configs/train_pct.yaml
 
-python scripts/train.py --config configs/train_pct_apml.yaml --resume data/train_runs/cnn-transformer-apml/checkpoints/epoch_0030.pt
+python scripts/train.py --config configs/train_pct_apml.yaml --resume outputs/train_runs/cnn-apml/checkpoints/epoch_0030.pt
 python scripts/infer.py --config configs/train_pct.yaml --checkpoint data/train_runs/pct_refiner/checkpoints/best.pt --all
 
 将训练集对应数量的数据移动到测试集
@@ -31,7 +31,7 @@ python scripts/plot_train_log.py --log data/train_runs/exp_no_light/train_log.cs
 | 02933112        | 柜子                 |          455 |           30 |
 | 02946921        | 罐子                 |          103 |            5 |
 | 02954340        | 帽子                 |           53 |            3 |
-| 02992529        | 椅子                 |          514 |           30 |
+| 02992529        | 手机                 |          100 |           5 |
 | 03261776        | 耳机                 |           69 |            4 |
 | 03337140        | 文件柜               |          288 |           10 |
 | 03513137        | 头盔                 |          154 |            8 |
@@ -44,5 +44,5 @@ python scripts/plot_train_log.py --log data/train_runs/exp_no_light/train_log.cs
 | 04099429        | 火箭                 |           81 |            4 |
 | 04460130        | 塔                   |          127 |            6 |
 +-----------------+----------------------+--------------+--------------+
-| 合计            | 23 个类别            |         5415 |          265 |
+| 合计            | 23 个类别            |         5001 |          265 |
 +-----------------+----------------------+--------------+--------------+
