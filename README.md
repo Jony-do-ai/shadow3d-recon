@@ -1,8 +1,20 @@
 训练：在根目录执行
-python scripts/train.py --config configs/train_pct.yaml
+python scripts/train.py --config configs/train_pct_apml.yaml
 
 python scripts/train.py --config configs/train_pct_apml.yaml --resume outputs/train_runs/cnn-apml/checkpoints/epoch_0030.pt
-python scripts/infer.py --config configs/train_pct.yaml --checkpoint data/train_runs/pct_refiner/checkpoints/best.pt --all
+
+python scripts/infer.py --config data/train_runs/apml-shadow-2part2/config_dump.yaml `
+    --checkpoint data/train_runs/apml-shadow-2part2/checkpoints/best.pt --all
+
+python scripts/eval_existing_pcd_metrics.py `
+  --root outputs/infer/apml-nopct `
+  --thresholds 0.01 0.02 0.03 0.05 `
+  --device cuda
+
+python scripts/eval_existing_pcd_metrics_csv.py `
+    --root outputs/infer/apml-shadow-2part2 `
+    --thresholds 0.01 0.02 0.03 0.05 `
+    --device cuda
 
 将训练集对应数量的数据移动到测试集
 只列出转移信息用于查看，不做转移操作：
