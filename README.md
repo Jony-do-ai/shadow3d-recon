@@ -1,7 +1,7 @@
 训练：在根目录执行
-python scripts/train.py --config configs/train_pct.yaml
+python scripts/train.py --config configs/train_pct_apml.yaml
 
-python scripts/train.py --config configs/train_pct_apml.yaml --resume outputs/train_runs/cnn-apml/checkpoints/epoch_0030.pt
+python scripts/train.py --config configs/train_pct_apml.yaml --resume outputs/train_runs/cnn-apml-nolight/checkpoints/epoch_0010.pt
 python scripts/infer.py --config configs/train_pct.yaml --checkpoint data/train_runs/pct_refiner/checkpoints/best.pt --all
 
 将训练集对应数量的数据移动到测试集

@@ -62,11 +62,40 @@ class LightEncoder(nn.Module):
             nn.Linear(3, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, light_feat_dim),
-            nn.ReLU(inplace=True),
         )
 
     def forward(self, light_dir):
         return self.mlp(light_dir)
+
+class LightFiLMModulator(nn.Module):
+    """
+    残差式 FiLM:
+        out = img_feat * (1 + gamma) + beta
+
+    零初始化最后一层:训练初期 gamma=beta=0,等价于不调制;
+    训练中 gamma/beta 自由学习调制强度,不再被 film_scale 永久压制。
+    """
+    def __init__(
+        self,
+        light_feat_dim: int = 128,
+        image_feat_dim: int = 256,
+        film_scale: float = 0.1,
+    ):
+        super().__init__()
+        self.film_scale = film_scale
+        self.mlp = nn.Sequential(
+            nn.Linear(light_feat_dim, image_feat_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(image_feat_dim * 2, image_feat_dim * 2),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, img_feat: torch.Tensor, light_feat: torch.Tensor) -> torch.Tensor:
+        gamma_beta = self.mlp(light_feat)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
+        img_feat = img_feat * (1.0 + self.film_scale * gamma) + self.film_scale * beta
+        return img_feat
 
 
 class PointCloudDecoder(nn.Module):
@@ -182,22 +211,26 @@ class ShadowPointBaseline(nn.Module):
         refiner_blocks: int = 2,
         refiner_num_heads: int = 4,
         refiner_delta_scale: float = 0.05,
+        film_scale: float = 0.1,
     ):
         super().__init__()
         self.num_frames = num_frames
         self.fused_dim = fused_dim
         self.image_encoder = ShadowImageEncoder(feat_dim=image_feat_dim)
         self.light_encoder = LightEncoder(light_feat_dim=light_feat_dim)
-        self.global_dim = fused_dim * num_frames
-
-        self.fusion = nn.Sequential(
-            nn.Linear(image_feat_dim + light_feat_dim, fused_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(fused_dim, fused_dim),
-            nn.ReLU(inplace=True),
+        self.light_film = LightFiLMModulator(
+            light_feat_dim=light_feat_dim,
+            image_feat_dim=fused_dim,
+            film_scale=film_scale,
         )
+        self.fusion_linear1 = nn.Linear(image_feat_dim, fused_dim)
+        self.fusion_linear2 = nn.Linear(fused_dim, fused_dim)
 
-        self.decoder = PointCloudDecoder(global_dim=self.global_dim, num_points=num_points)
+        self.global_dim = fused_dim * num_frames
+        self.decoder = PointCloudDecoder(
+            global_dim=self.global_dim,
+            num_points=num_points,
+        )
 
         self.use_refiner = use_refiner
         if self.use_refiner:
@@ -206,7 +239,7 @@ class ShadowPointBaseline(nn.Module):
                 num_blocks=refiner_blocks,
                 num_heads=refiner_num_heads,
                 delta_scale=refiner_delta_scale,
-                cond_dim=self.global_dim,   # 控制是否注入
+                cond_dim=self.global_dim,
             )
         else:
             self.refiner = None
@@ -214,16 +247,20 @@ class ShadowPointBaseline(nn.Module):
     def encode_global_feature(self, shadow_seq: torch.Tensor, light_dir: torch.Tensor) -> torch.Tensor:
         b, k, c, h, w = shadow_seq.shape
 
-        shadow_seq = shadow_seq.view(b * k, c, h, w)
-        light_dir = light_dir.view(b * k, 3)
+        shadow_seq = shadow_seq.reshape(b * k, c, h, w)
+        light_dir = light_dir.reshape(b * k, 3)
 
-        img_feat = self.image_encoder(shadow_seq)
-        light_feat = self.light_encoder(light_dir)
+        img_feat = self.image_encoder(shadow_seq)  # [B*K, image_feat_dim]
+        light_feat = self.light_encoder(light_dir)  # [B*K, light_feat_dim]
 
-        fused = torch.cat([img_feat, light_feat], dim=-1)
-        fused = self.fusion(fused)
-        fused = fused.view(b, k, -1)
+        h1 = self.fusion_linear1(img_feat)  # [B*K, fused_dim]
+        h1 = self.light_film(h1, light_feat)  # [B*K, fused_dim]
+        h1 = torch.relu(h1)
 
+        h2 = self.fusion_linear2(h1)  # [B*K, fused_dim]
+        fused = torch.relu(h2)
+
+        fused = fused.reshape(b, k, -1)
         global_feat = fused.reshape(b, k * fused.shape[-1])
         return global_feat
 
