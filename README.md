@@ -3,9 +3,16 @@ python scripts/train.py --config configs/train_pct_apml.yaml
 
 python scripts/train.py --config configs/train_pct_apml.yaml --resume outputs/train_runs/cnn-apml/checkpoints/epoch_0030.pt
 
+python scripts/train.py `
+  --config configs/train_pct_apml_projection_stage2.yaml `
+  --resume outputs/train_runs/cnn-apml/checkpoints/epoch_0100.pt `
+  --model_only_resume
+
+推理
 python scripts/infer.py --config data/train_runs/apml-shadow-2part2/config_dump.yaml `
     --checkpoint data/train_runs/apml-shadow-2part2/checkpoints/best.pt --all
 
+推理指标
 python scripts/eval_existing_pcd_metrics.py `
   --root outputs/infer/apml-nopct `
   --thresholds 0.01 0.02 0.03 0.05 `

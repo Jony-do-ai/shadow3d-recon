@@ -22,6 +22,10 @@ if str(SRC_ROOT) not in sys.path:
 from shadow3d.datasets.shadow_sequence_dataset import ShadowSequenceDataset
 from shadow3d.losses.chamfer import point_recon_loss
 from shadow3d.losses.apml_loss import APML
+from shadow3d.losses.projection_splat import (
+    multi_light_projection_loss,
+    save_projection_debug,
+)
 from shadow3d.models.shadow_point_baseline import ShadowPointBaseline
 
 import open3d as o3d
@@ -143,6 +147,21 @@ def init_train_log(log_path: str,resume: bool = False):
         "loss_hd",
         "loss_repulsion",
 
+        "loss_proj",
+        "loss_proj_bce",
+        "loss_proj_dice",
+        "loss_proj_iou",
+        "proj_weight",
+        "proj_valid_ratio",
+        "proj_pred_mask_mean",
+        "proj_gt_mask_mean",
+        "proj_pred_mask_max",
+        "proj_gt_mask_max",
+        "proj_u_min",
+        "proj_u_max",
+        "proj_v_min",
+        "proj_v_max",
+
         "precision_0_01",
         "recall_0_01",
         "fscore_0_01",
@@ -191,6 +210,21 @@ def append_train_log(
         "loss_bbox": float(stats["loss_bbox"]),
         "loss_hd": float(stats.get("loss_hd", 0.0)),
         "loss_repulsion": float(stats.get("loss_repulsion", 0.0)),
+
+        "loss_proj": float(stats.get("loss_proj", 0.0)),
+        "loss_proj_bce": float(stats.get("loss_proj_bce", 0.0)),
+        "loss_proj_dice": float(stats.get("loss_proj_dice", 0.0)),
+        "loss_proj_iou": float(stats.get("loss_proj_iou", 0.0)),
+        "proj_weight": float(stats.get("proj_weight", 0.0)),
+        "proj_valid_ratio": float(stats.get("proj_valid_ratio", 0.0)),
+        "proj_pred_mask_mean": float(stats.get("proj_pred_mask_mean", 0.0)),
+        "proj_gt_mask_mean": float(stats.get("proj_gt_mask_mean", 0.0)),
+        "proj_pred_mask_max": float(stats.get("proj_pred_mask_max", 0.0)),
+        "proj_gt_mask_max": float(stats.get("proj_gt_mask_max", 0.0)),
+        "proj_u_min": float(stats.get("proj_u_min", 0.0)),
+        "proj_u_max": float(stats.get("proj_u_max", 0.0)),
+        "proj_v_min": float(stats.get("proj_v_min", 0.0)),
+        "proj_v_max": float(stats.get("proj_v_max", 0.0)),
 
         "precision_0_01": float(stats["precision_0_01"]),
         "recall_0_01": float(stats["recall_0_01"]),
@@ -281,7 +315,93 @@ def compute_point_loss_dict(
 
     raise ValueError(f"Unknown point_loss_type: {point_loss_type}")
 
-def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, global_step, log_every=10, save_ply_every=5, out_dir=None,use_light=True,apml_criterion=None,):
+
+def get_projection_cfg(loss_cfg: dict) -> dict:
+    """
+    兼容两种配置写法：
+    loss:
+      projection: {...}
+    或：
+      projection_loss: {...}
+    """
+    if "projection" in loss_cfg and isinstance(loss_cfg["projection"], dict):
+        return loss_cfg["projection"]
+    if "projection_loss" in loss_cfg and isinstance(loss_cfg["projection_loss"], dict):
+        return loss_cfg["projection_loss"]
+    return {}
+
+
+def compute_projection_weight(proj_cfg: dict, epoch_idx: int, stage_epoch_idx: int = None) -> float:
+    """
+    计算 projection loss 当前 epoch 的权重。
+
+    默认按 stage_epoch_idx 调度：
+    - 从 epoch100 checkpoint 开第二阶段时，stage_epoch_idx=1 表示第二阶段第 1 个 epoch。
+    - 因此配置 start_epoch: 6, ramp_epochs: 10 表示第二阶段第 6 个 epoch 开始逐步开启。
+
+    如果想用绝对 epoch 编号，例如 epoch106 开启，可以设：
+      schedule_by: absolute
+      start_epoch: 106
+    """
+    if not bool(proj_cfg.get("enabled", False)):
+        return 0.0
+
+    base_weight = float(proj_cfg.get("weight", 0.0))
+    if base_weight <= 0.0:
+        return 0.0
+
+    schedule_by = str(proj_cfg.get("schedule_by", "stage")).lower()
+    schedule_epoch = epoch_idx if schedule_by == "absolute" else int(stage_epoch_idx or epoch_idx)
+
+    start_epoch = int(proj_cfg.get("start_epoch", 1))
+    ramp_epochs = int(proj_cfg.get("ramp_epochs", 0))
+
+    if schedule_epoch < start_epoch:
+        return 0.0
+
+    if ramp_epochs <= 0:
+        return base_weight
+
+    progress = (schedule_epoch - start_epoch + 1) / float(ramp_epochs)
+    progress = max(0.0, min(1.0, progress))
+    return base_weight * progress
+
+
+def zero_projection_stats(device: torch.device) -> dict:
+    z = torch.tensor(0.0, device=device)
+    return {
+        "loss_proj": z,
+        "loss_proj_bce": z,
+        "loss_proj_dice": z,
+        "loss_proj_iou": z,
+        "proj_weight": z,
+        "proj_valid_ratio": z,
+        "proj_pred_mask_mean": z,
+        "proj_gt_mask_mean": z,
+        "proj_pred_mask_max": z,
+        "proj_gt_mask_max": z,
+        "proj_u_min": z,
+        "proj_u_max": z,
+        "proj_v_min": z,
+        "proj_v_max": z,
+    }
+
+
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    loss_cfg,
+    epoch_idx,
+    global_step,
+    log_every=10,
+    save_ply_every=5,
+    out_dir=None,
+    use_light=True,
+    apml_criterion=None,
+    stage_epoch_idx=None,
+):
     model.train()
     running = {
         "loss_total": 0.0,
@@ -293,6 +413,21 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
         "loss_bbox": 0.0,
         "loss_hd": 0.0,
         "loss_repulsion": 0.0,
+
+        "loss_proj": 0.0,
+        "loss_proj_bce": 0.0,
+        "loss_proj_dice": 0.0,
+        "loss_proj_iou": 0.0,
+        "proj_weight": 0.0,
+        "proj_valid_ratio": 0.0,
+        "proj_pred_mask_mean": 0.0,
+        "proj_gt_mask_mean": 0.0,
+        "proj_pred_mask_max": 0.0,
+        "proj_gt_mask_max": 0.0,
+        "proj_u_min": 0.0,
+        "proj_u_max": 0.0,
+        "proj_v_min": 0.0,
+        "proj_v_max": 0.0,
 
         "precision_0_01": 0.0,
         "recall_0_01": 0.0,
@@ -307,18 +442,24 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
         "fscore_0_05": 0.0,
     }
 
+    proj_cfg = get_projection_cfg(loss_cfg)
+    proj_debug_cfg = proj_cfg.get("debug", {}) if isinstance(proj_cfg.get("debug", {}), dict) else {}
+
     pbar = tqdm(loader, desc=f"Epoch {epoch_idx}", leave=True)
 
     for batch_idx, batch in enumerate(pbar):
         shadow_seq = batch["shadow_seq"].to(device)  # [B, K, 1, H, W]
-        light_dir = batch["light_dir"].to(device)    # [B, K, 3]
+        raw_light_dir = batch["light_dir"].to(device)  # [B, K, 3]
         points_gt = batch["points_gt"].to(device)    # [B, N, 3]
 
-        # 消融实验：不使用真实光线输入
+        # 消融实验：不使用真实光线作为模型输入。
+        # 注意：projection loss 默认仍使用 raw_light_dir 做几何投影，
+        # 如果在 no-light 消融中不想引入光照监督，应关闭 projection.enabled。
+        model_light_dir = raw_light_dir
         if not use_light:
-            light_dir = torch.zeros_like(light_dir)
+            model_light_dir = torch.zeros_like(raw_light_dir)
 
-        pred_points = model(shadow_seq, light_dir)
+        pred_points = model(shadow_seq, model_light_dir)
 
         loss_dict = compute_point_loss_dict(
             pred_points=pred_points,
@@ -327,6 +468,64 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
             apml_criterion=apml_criterion,
         )
 
+        proj_stats = zero_projection_stats(device)
+        proj_weight = compute_projection_weight(
+            proj_cfg=proj_cfg,
+            epoch_idx=epoch_idx,
+            stage_epoch_idx=stage_epoch_idx,
+        )
+        proj_stats["proj_weight"] = torch.tensor(float(proj_weight), device=device)
+
+        if bool(proj_cfg.get("enabled", False)) and proj_weight > 0.0:
+            # 默认用真实 light_dir 做投影。若显式设置 use_model_light_dir=true，则使用模型输入光照。
+            proj_light_dir = model_light_dir if bool(proj_cfg.get("use_model_light_dir", False)) else raw_light_dir
+
+            proj_dict = multi_light_projection_loss(
+                pred_points=pred_points,
+                gt_points=points_gt,
+                light_dir=proj_light_dir,
+                image_size=int(proj_cfg.get("render_size", proj_cfg.get("image_size", 64))),
+                sigma=float(proj_cfg.get("sigma", 2.0)),
+                projection_range=float(proj_cfg.get("projection_range", 1.2)),
+                loss_type=str(proj_cfg.get("loss_type", "dice_bce")),
+                bce_weight=float(proj_cfg.get("bce_weight", 0.5)),
+                dice_weight=float(proj_cfg.get("dice_weight", 0.5)),
+                iou_weight=float(proj_cfg.get("iou_weight", 0.5)),
+                eps=float(proj_cfg.get("eps", 1e-6)),
+                detach_gt=bool(proj_cfg.get("detach_gt", True)),
+            )
+
+            loss_dict["loss_total"] = loss_dict["loss_total"] + float(proj_weight) * proj_dict["loss_proj"]
+            proj_stats.update({
+                "loss_proj": proj_dict["loss_proj"].detach(),
+                "loss_proj_bce": proj_dict["loss_proj_bce"],
+                "loss_proj_dice": proj_dict["loss_proj_dice"],
+                "loss_proj_iou": proj_dict["loss_proj_iou"],
+                "proj_valid_ratio": proj_dict["proj_valid_ratio"],
+                "proj_pred_mask_mean": proj_dict["proj_pred_mask_mean"],
+                "proj_gt_mask_mean": proj_dict["proj_gt_mask_mean"],
+                "proj_pred_mask_max": proj_dict["proj_pred_mask_max"],
+                "proj_gt_mask_max": proj_dict["proj_gt_mask_max"],
+                "proj_u_min": proj_dict["proj_u_min"],
+                "proj_u_max": proj_dict["proj_u_max"],
+                "proj_v_min": proj_dict["proj_v_min"],
+                "proj_v_max": proj_dict["proj_v_max"],
+            })
+
+            if bool(proj_debug_cfg.get("enabled", False)) and out_dir is not None:
+                save_every_iter = int(proj_debug_cfg.get("save_every_iter", 500))
+                if save_every_iter > 0 and (global_step + 1) % save_every_iter == 0:
+                    debug_dir = os.path.join(out_dir, "projection_debug", f"epoch_{epoch_idx:04d}_step_{global_step + 1:08d}")
+                    save_projection_debug(
+                        pred_mask=proj_dict["pred_mask"],
+                        gt_mask=proj_dict["gt_mask"],
+                        save_dir=debug_dir,
+                        prefix=f"epoch_{epoch_idx:04d}_step_{global_step + 1:08d}",
+                        max_samples=int(proj_debug_cfg.get("num_samples", 1)),
+                        save_all_lights=bool(proj_debug_cfg.get("save_all_lights", True)),
+                    )
+
+        loss_dict.update(proj_stats)
         loss = loss_dict["loss_total"]
 
         optimizer.zero_grad()
@@ -344,22 +543,24 @@ def train_one_epoch(model, loader, optimizer, device, loss_cfg, epoch_idx, globa
             avg_apml = running["loss_apml"] / (batch_idx + 1)
             avg_p2g = running["loss_p2g"] / (batch_idx + 1)
             avg_g2p = running["loss_g2p"] / (batch_idx + 1)
-            avg_center = running["loss_center"] / (batch_idx + 1)
-            avg_bbox = running["loss_bbox"] / (batch_idx + 1)
             avg_hd = running["loss_hd"] / (batch_idx + 1)
             avg_rep = running["loss_repulsion"] / (batch_idx + 1)
             avg_f002 = running["fscore_0_02"] / (batch_idx + 1)
+            avg_proj = running["loss_proj"] / (batch_idx + 1)
+            avg_proj_w = running["proj_weight"] / (batch_idx + 1)
+            avg_valid = running["proj_valid_ratio"] / (batch_idx + 1)
 
             pbar.set_postfix(
                 total=f"{avg_total:.4f}",
                 cd=f"{avg_cd:.4f}",
                 apml=f"{avg_apml:.4f}",
+                proj=f"{avg_proj:.4f}",
+                pw=f"{avg_proj_w:.1e}",
+                valid=f"{avg_valid:.2f}",
                 p2g=f"{avg_p2g:.4f}",
                 g2p=f"{avg_g2p:.4f}",
                 hd=f"{avg_hd:.4f}",
                 rep=f"{avg_rep:.4f}",
-                # center=f"{avg_center:.4f}",
-                # bbox=f"{avg_bbox:.4f}",
                 f002=f"{avg_f002:.4f}",
             )
 
@@ -446,8 +647,12 @@ def main():
         "--resume",
         type=str,
         default=None,
-        help="Path to a .pt checkpoint to resume training from. "
-             "Continues epoch numbering and appends to the existing train_log.csv.",
+        help="Path to a .pt checkpoint. Can be normal resume or model-only stage2 initialization.",
+    )
+    parser.add_argument(
+        "--model_only_resume",
+        action="store_true",
+        help="Load only checkpoint['model']; do not load optimizer state. Recommended for stage2 fine-tuning.",
     )
     args = parser.parse_args()
 
@@ -559,19 +764,32 @@ def main():
     num_epochs = int(optim_cfg.get("epochs", 50))
 
     # -------------------------
-    # resume from checkpoint (if any)
+    # resume / stage2 init from checkpoint (if any)
     # -------------------------
     start_epoch = 0  # 已完成的 epoch 数；下一个 epoch = start_epoch + 1
+    load_optimizer = bool(optim_cfg.get("load_optimizer", True)) and not args.model_only_resume
+    keep_epoch_number = bool(optim_cfg.get("keep_epoch_number", True))
+
     if args.resume is not None:
         if not os.path.isfile(args.resume):
             raise FileNotFoundError(f"--resume checkpoint not found: {args.resume}")
-        print(f"[INFO] Resuming from checkpoint: {args.resume}")
+        print(f"[INFO] Loading checkpoint: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = int(ckpt.get("step", 0))
-        print(f"[INFO] Resumed at epoch {start_epoch}, "
-              f"will continue from epoch {start_epoch + 1} to {num_epochs}")
+
+        if load_optimizer and "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            print("[INFO] Loaded optimizer state from checkpoint.")
+        else:
+            print("[INFO] Model-only resume: optimizer is newly initialized from current config.")
+
+        if keep_epoch_number:
+            start_epoch = int(ckpt.get("step", 0))
+        else:
+            start_epoch = 0
+
+        print(f"[INFO] Checkpoint epoch={ckpt.get('step', 'unknown')}, "
+              f"start_epoch={start_epoch}, will train from epoch {start_epoch + 1} to {num_epochs}")
         if start_epoch >= num_epochs:
             print(f"[WARN] start_epoch ({start_epoch}) >= num_epochs ({num_epochs}), "
                   f"nothing to train.")
@@ -593,7 +811,10 @@ def main():
             yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
 
     train_log_path = os.path.join(out_dir, "train_log.csv")
-    init_train_log(train_log_path, resume=(args.resume is not None))
+    init_train_log(
+        train_log_path,
+        resume=(args.resume is not None and bool(log_cfg.get("append_on_resume", load_optimizer))),
+    )
     print(f"[INFO] Train log will be saved to: {train_log_path}")
 
     # -------------------------
@@ -649,13 +870,15 @@ def main():
             out_dir=out_dir,
             use_light=use_light,
             apml_criterion=apml_criterion,
+            stage_epoch_idx=epoch - start_epoch,
         )
         # 每个 epoch 都计算训练耗时
         epoch_time_sec = time.time() - epoch_start_time
         current_lr = optimizer.param_groups[0]["lr"]
 
         elapsed_sec = time.time() - train_start_time
-        avg_epoch_sec = elapsed_sec / epoch
+        completed_this_run = max(epoch - start_epoch, 1)
+        avg_epoch_sec = elapsed_sec / completed_this_run
         remaining_epochs = num_epochs - epoch
         remaining_sec = avg_epoch_sec * remaining_epochs
         estimated_total_sec = avg_epoch_sec * num_epochs
@@ -674,6 +897,9 @@ def main():
             f"bbox={stats['loss_bbox']:.6f}, "
             f"hd={stats.get('loss_hd', 0.0):.6f}, "
             f"rep={stats.get('loss_repulsion', 0.0):.6f}, "
+            f"proj={stats.get('loss_proj', 0.0):.6f}, "
+            f"proj_w={stats.get('proj_weight', 0.0):.2e}, "
+            f"proj_valid={stats.get('proj_valid_ratio', 0.0):.3f}, "
             f"epoch_time={format_seconds(epoch_time_sec)}, "
             f"elapsed={format_seconds(elapsed_sec)}, "
             f"eta={format_seconds(remaining_sec)}, "

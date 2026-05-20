@@ -1,0 +1,81 @@
+# Stage2 配置：从 cnn-apml-1frame 的 epoch_0100.pt 继续微调
+# 使用方式示例：
+# python scripts/train.py --config configs/train_pct_apml_projection_stage2.yaml --resume outputs/train_runs/cnn-apml-1frame/checkpoints/epoch_0100.pt --model_only_resume
+#
+# 说明：
+# 1) 保留原 APML 主干配置：apml_weight=0.001、repulsion=0.005。
+# 2) 第二阶段 lr 从 0.0005 降到 0.00005。
+# 3) projection.weight 先用保守的 0.0001；如果 debug 图正常且指标不崩，再试 0.0005。
+# 4) schedule_by=stage 表示从本次第二阶段训练开始计数，start_epoch=6 即总 epoch106 开启。
+
+seed: 42
+device: cuda
+ablation:
+  use_light: true
+data:
+  root: data/train_runs
+  sequences_dir: dataset
+  frames_per_seq: 10
+  image_size:
+  - 256
+  - 256
+  image_key: shadow_mask.png
+  batch_size: 2
+  num_workers: 0
+test: data/test_runs
+model:
+  num_frames: 10
+  image_feat_dim: 256
+  light_feat_dim: 128
+  fused_dim: 256
+  num_points: 2048
+  use_refiner: false
+  refiner_hidden_dim: 128
+  refiner_blocks: 2
+  refiner_num_heads: 4
+  refiner_delta_scale: 0.05
+loss:
+  point_loss_type: apml
+  apml_weight: 0.001
+  apml_p_min: 0.8
+  apml_sinkhorn_iters: 20
+  cd: 1.0
+  center: 0.0
+  bbox: 0.0
+  bbox_radius: 1.0
+  hd: 0.0
+  hd_top_ratio: 0.1
+  repulsion: 0.005
+  repulsion_radius: 0.03
+  repulsion_k: 16
+  projection:
+    enabled: true
+    weight: 0.0001
+    schedule_by: stage
+    start_epoch: 6
+    ramp_epochs: 10
+    render_size: 64
+    sigma: 1.5
+    projection_range: 1.2
+    loss_type: dice_bce
+    bce_weight: 0.5
+    dice_weight: 0.5
+    eps: 1.0e-06
+    detach_gt: true
+    use_model_light_dir: false
+    debug:
+      enabled: true
+      save_every_iter: 500
+      num_samples: 1
+      save_all_lights: true
+optim:
+  lr: 5.0e-05
+  weight_decay: 0.0
+  epochs: 130
+  load_optimizer: false
+  keep_epoch_number: true
+log:
+  out_dir: outputs/train_runs/cnn-apml-proj-stage2
+  print_every: 10
+  save_every_epoch: 10
+  append_on_resume: false
