@@ -173,6 +173,7 @@ def run_inference(
     dataset: ShadowSequenceDataset,
     index: int,
     device: torch.device,
+    use_light: bool = True,
 ):
     """
     返回：
@@ -186,6 +187,9 @@ def run_inference(
     light_dir = sample["light_dir"].unsqueeze(0).to(device)     # [1, K, 3]
     points_gt = sample["points_gt"]                             # [N, 3]
     seq_name = sample.get("seq_name", f"sample_{index:04d}")
+
+    if not use_light:
+        light_dir = torch.zeros_like(light_dir)
 
     pred_points = model(shadow_seq, light_dir)                  # [1, N, 3]
     pred_points = pred_points[0].detach().cpu()                 # [N, 3]
@@ -232,12 +236,17 @@ def main():
             raise IndexError(f"index out of range: {args.index}, dataset size = {len(dataset)}")
         indices = [args.index]
 
+    ablation_cfg = cfg.get("ablation", {})
+    use_light = bool(ablation_cfg.get("use_light", True))
+    print(f"[INFO] Inference use_light = {use_light}")
+
     for idx in indices:
         pred_points, gt_points, seq_name = run_inference(
             model=model,
             dataset=dataset,
             index=idx,
             device=device,
+            use_light=use_light,
         )
 
         save_dir = os.path.join(final_output_dir, seq_name)
