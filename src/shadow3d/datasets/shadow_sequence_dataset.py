@@ -184,6 +184,26 @@ def sample_or_pad_points(points: np.ndarray, num_points: int, seed: int = 0) -> 
     idx = np.concatenate([np.arange(n), extra], axis=0)
     return points[idx]
 
+def select_frame_dirs_uniform(frame_dirs: List[str], frames_per_seq: int) -> List[str]:
+    """
+    从完整帧序列中均匀选择 frames_per_seq 帧。
+    用于 1 / 3 / 5 / 10 帧消融，避免只取前 K 帧导致光照角度集中。
+    """
+    total = len(frame_dirs)
+
+    if frames_per_seq <= 0:
+        raise ValueError(f"frames_per_seq must be positive, got {frames_per_seq}")
+
+    if total < frames_per_seq:
+        raise ValueError(
+            f"Not enough frames: total={total}, required={frames_per_seq}"
+        )
+
+    if frames_per_seq == total:
+        return frame_dirs
+
+    indices = np.linspace(0, total - 1, frames_per_seq, dtype=int).tolist()
+    return [frame_dirs[i] for i in indices]
 
 class ShadowSequenceDataset(Dataset):
     """
@@ -279,7 +299,7 @@ class ShadowSequenceDataset(Dataset):
                 if len(frame_dirs) < self.frames_per_seq:
                     continue
 
-                frame_dirs = frame_dirs[:self.frames_per_seq]
+                frame_dirs = select_frame_dirs_uniform(frame_dirs, self.frames_per_seq)
 
                 geom_dir = os.path.join(seq_dir, "object_geometry")
                 if not os.path.isdir(geom_dir):
