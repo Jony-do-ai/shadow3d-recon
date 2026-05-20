@@ -56,16 +56,40 @@ def save_point_cloud_ply(points: torch.Tensor, ply_path: str) -> None:
 
 def build_model_from_config(cfg: Dict[str, Any], device: torch.device) -> ShadowPointBaseline:
     """
-    按配置构建模型
+    按配置构建模型。
+
+    固定 10-slot 帧数消融逻辑：
+    - data.frames_per_seq 表示真实读取几帧，例如 1 / 3 / 5 / 10
+    - model.num_frames 表示模型固定最大帧槽位数，例如统一固定为 10
     """
     model_cfg = cfg.get("model", {})
+    data_cfg = cfg.get("data", {})
+
+    effective_num_frames = int(data_cfg.get("frames_per_seq", 10))
+    max_num_frames = int(model_cfg.get("num_frames", 10))
+
+    if effective_num_frames > max_num_frames:
+        raise ValueError(
+            f"data.frames_per_seq ({effective_num_frames}) cannot be larger than "
+            f"model.num_frames ({max_num_frames}). "
+            f"For fixed-slot ablation, set model.num_frames=10."
+        )
+
+    print(
+        f"[INFO] Inference effective frames_per_seq = {effective_num_frames}, "
+        f"fixed model.num_frames = {max_num_frames}"
+    )
 
     model = ShadowPointBaseline(
         image_feat_dim=int(model_cfg.get("image_feat_dim", 256)),
         light_feat_dim=int(model_cfg.get("light_feat_dim", 128)),
         fused_dim=int(model_cfg.get("fused_dim", 256)),
         num_points=int(model_cfg.get("num_points", 2048)),
-        num_frames=int(model_cfg.get("num_frames", 10)),
+
+        # 注意：这里必须是固定最大槽位数，不是真实读取帧数。
+        # 1/3/5/10 帧消融时，这里都应该是 10。
+        num_frames=max_num_frames,
+
         use_refiner=bool(model_cfg.get("use_refiner", True)),
         refiner_hidden_dim=int(model_cfg.get("refiner_hidden_dim", 128)),
         refiner_blocks=int(model_cfg.get("refiner_blocks", 2)),
@@ -78,14 +102,32 @@ def build_model_from_config(cfg: Dict[str, Any], device: torch.device) -> Shadow
 
 def build_dataset_from_config(cfg: Dict[str, Any]) -> ShadowSequenceDataset:
     data_cfg = cfg["data"]
+    model_cfg = cfg.get("model", {})
 
     # 推理时优先使用 test 路径；没有的话再退回训练集 root
     root = cfg.get("test", data_cfg["root"])
 
+    effective_num_frames = int(data_cfg.get("frames_per_seq", 10))
+    max_num_frames = int(model_cfg.get("num_frames", 10))
+
+    if effective_num_frames > max_num_frames:
+        raise ValueError(
+            f"data.frames_per_seq ({effective_num_frames}) cannot be larger than "
+            f"model.num_frames ({max_num_frames})."
+        )
+
+    print(
+        f"[INFO] Dataset frames_per_seq = {effective_num_frames}, "
+        f"model fixed slots = {max_num_frames}"
+    )
+
     dataset = ShadowSequenceDataset(
         root=root,
         sequences_dir=data_cfg.get("sequences_dir", "dataset"),
-        frames_per_seq=int(data_cfg.get("frames_per_seq", 10)),
+
+        # 这里是真实读取几帧，不是固定槽位数。
+        frames_per_seq=effective_num_frames,
+
         image_size=tuple(data_cfg.get("image_size", [256, 256])),
         image_key=data_cfg.get("image_key", "shadow_mask.png"),
         num_points=int(cfg["model"].get("num_points", 2048)),
@@ -117,7 +159,7 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
         else:
             new_state_dict[k] = v
 
-    missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(new_state_dict, strict=True)
     print(f"[INFO] Checkpoint loaded from: {ckpt_path}")
     if missing:
         print(f"[WARN] Missing keys: {missing}")

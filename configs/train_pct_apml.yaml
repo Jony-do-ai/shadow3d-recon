@@ -7,6 +7,7 @@ ablation:
 data:
   root: data/train_runs
   sequences_dir: dataset
+  #1,3,5帧消融
   frames_per_seq: 1
   image_size: [256, 256]
   image_key: shadow_mask.png
@@ -18,6 +19,7 @@ test:
 
 
 model:
+  num_frames: 10
   image_feat_dim: 256
   light_feat_dim: 128
   fused_dim: 256

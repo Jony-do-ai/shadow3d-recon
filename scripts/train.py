@@ -470,10 +470,29 @@ def main():
     # data
     # -------------------------
     data_cfg = cfg["data"]
+
+    # effective_num_frames: 真实读取几帧，用于帧数消融，1 / 3 / 5 / 10
+    effective_num_frames = int(data_cfg.get("frames_per_seq", 10))
+
+    # max_num_frames: 模型固定最大帧槽位数。为了公平消融，统一固定为 10。
+    max_num_frames = int(model_cfg.get("num_frames", 10))
+
+    if effective_num_frames > max_num_frames:
+        raise ValueError(
+            f"data.frames_per_seq ({effective_num_frames}) cannot be larger than "
+            f"model.num_frames ({max_num_frames}). "
+            f"For 1/3/5/10 ablation, set model.num_frames=10."
+        )
+
+    print(
+        f"[INFO] effective frames_per_seq = {effective_num_frames}, "
+        f"fixed model.num_frames = {max_num_frames}"
+    )
+
     dataset = ShadowSequenceDataset(
         root=data_cfg["root"],
         sequences_dir=data_cfg.get("sequences_dir", "dataset"),
-        frames_per_seq=int(data_cfg.get("frames_per_seq", 10)),
+        frames_per_seq=effective_num_frames,
         image_size=tuple(data_cfg.get("image_size", [256, 256])),
         image_key=data_cfg.get("image_key", "shadow_mask.png"),
         num_points=int(cfg["model"].get("num_points", 2048)),
@@ -515,7 +534,11 @@ def main():
         light_feat_dim=int(model_cfg.get("light_feat_dim", 128)),
         fused_dim=int(model_cfg.get("fused_dim", 256)),
         num_points=int(model_cfg.get("num_points", 2048)),
-        num_frames=int(model_cfg.get("num_frames", 10)),
+
+        # 注意：这里传的是固定最大帧槽位数，不是真实读取帧数。
+        # 例如 1/3/5/10 帧消融时，这里都固定为 10。
+        num_frames=max_num_frames,
+
         use_refiner=bool(model_cfg.get("use_refiner", True)),
         refiner_hidden_dim=int(model_cfg.get("refiner_hidden_dim", 128)),
         refiner_blocks=int(model_cfg.get("refiner_blocks", 2)),

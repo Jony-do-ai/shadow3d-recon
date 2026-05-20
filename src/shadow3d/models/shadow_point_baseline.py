@@ -184,6 +184,8 @@ class ShadowPointBaseline(nn.Module):
         refiner_delta_scale: float = 0.05,
     ):
         super().__init__()
+        # num_frames 在这里表示固定的最大帧槽位数，例如统一固定为 10。
+        # 真实输入可以是 1 / 3 / 5 / 10 帧，但最后都会补齐到 num_frames 个特征槽
         self.num_frames = num_frames
         self.fused_dim = fused_dim
         self.image_encoder = ShadowImageEncoder(feat_dim=image_feat_dim)
@@ -212,19 +214,40 @@ class ShadowPointBaseline(nn.Module):
             self.refiner = None
 
     def encode_global_feature(self, shadow_seq: torch.Tensor, light_dir: torch.Tensor) -> torch.Tensor:
+        """
+        shadow_seq: [B, K, 1, H, W]
+        light_dir:  [B, K, 3]
+
+        K 可以是 1 / 3 / 5 / 10。
+        但模型内部会把 K 帧特征补齐到 self.num_frames 帧，
+        因此输出 global_feat 永远是 [B, self.num_frames * fused_dim]。
+        """
         b, k, c, h, w = shadow_seq.shape
+
+        if k > self.num_frames:
+            raise ValueError(
+                f"Input frames K={k} is larger than model.num_frames={self.num_frames}. "
+                f"For fixed-slot ablation, model.num_frames should be the maximum slot number, e.g. 10."
+            )
 
         shadow_seq = shadow_seq.view(b * k, c, h, w)
         light_dir = light_dir.view(b * k, 3)
 
-        img_feat = self.image_encoder(shadow_seq)
-        light_feat = self.light_encoder(light_dir)
+        img_feat = self.image_encoder(shadow_seq)  # [B*K, image_feat_dim]
+        light_feat = self.light_encoder(light_dir)  # [B*K, light_feat_dim]
 
         fused = torch.cat([img_feat, light_feat], dim=-1)
-        fused = self.fusion(fused)
-        fused = fused.view(b, k, -1)
+        fused = self.fusion(fused)  # [B*K, fused_dim]
+        fused = fused.view(b, k, -1)  # [B, K, fused_dim]
 
-        global_feat = fused.reshape(b, k * fused.shape[-1])
+        # 关键：在特征层补零，而不是在图像层补黑图。
+        # 这样补进去的帧不会被 CNN 解释成某种真实阴影。
+        if k < self.num_frames:
+            pad_frames = self.num_frames - k
+            pad_feat = fused.new_zeros(b, pad_frames, fused.shape[-1])
+            fused = torch.cat([fused, pad_feat], dim=1)  # [B, self.num_frames, fused_dim]
+
+        global_feat = fused.reshape(b, self.num_frames * fused.shape[-1])
         return global_feat
 
     def forward(self, shadow_seq: torch.Tensor, light_dir: torch.Tensor) -> torch.Tensor:
