@@ -8,7 +8,7 @@ data:
   root: data/train_runs
   sequences_dir: dataset
   #1,3,5帧消融
-  frames_per_seq: 1
+  frames_per_seq: 10
   image_size: [256, 256]
   image_key: shadow_mask.png
   batch_size: 2
@@ -58,9 +58,9 @@ loss:
 optim:
   lr: 0.0005
   weight_decay: 0.0
-  epochs: 100
+  epochs: 150
 
 log:
-  out_dir: outputs/train_runs/cnn-apml-1frame
+  out_dir: outputs/train_runs/cnn-apml
   print_every: 10
   save_every_epoch: 10
