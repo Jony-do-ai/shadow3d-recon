@@ -22,7 +22,8 @@ data:
   image_key: shadow_mask.png
   batch_size: 2
   num_workers: 0
-test: data/test_runs
+test:
+  "data/test_runs"
 model:
   num_frames: 10
   image_feat_dim: 256
@@ -71,7 +72,7 @@ loss:
 optim:
   lr: 5.0e-05
   weight_decay: 0.0
-  epochs: 130
+  epochs: 200
   load_optimizer: false
   keep_epoch_number: true
 log:

@@ -5,12 +5,15 @@ python scripts/train.py --config configs/train_pct_apml.yaml --resume outputs/tr
 
 python scripts/train.py `
   --config configs/train_pct_apml_projection_stage2.yaml `
-  --resume outputs/train_runs/cnn-apml/checkpoints/epoch_0100.pt `
+  --resume outputs/train_runs/cnn-apml/checkpoints/epoch_0150.pt `
   --model_only_resume
 
 推理
-python scripts/infer.py --config data/train_runs/apml-shadow-2part2/config_dump.yaml `
-    --checkpoint data/train_runs/apml-shadow-2part2/checkpoints/best.pt --all
+python scripts/infer.py --config configs/train_pct_apml_projection_stage2.yaml `
+    --checkpoint outputs/train_runs/cnn-apml-proj-stage2/checkpoints/best.pt --all
+
+python scripts/infer.py --config configs/train_pct_apml_projection_stage2.yaml `
+    --checkpoint outputs/train_runs/cnn-apml-proj-stage2/checkpoints/best.pt --all
 
 推理指标
 python scripts/eval_existing_pcd_metrics.py `
@@ -19,7 +22,7 @@ python scripts/eval_existing_pcd_metrics.py `
   --device cuda
 
 python scripts/eval_existing_pcd_metrics_csv.py `
-    --root outputs/infer/apml-shadow-2part2 `
+    --root outputs/infer/cnn-apml-proj-stage2 `
     --thresholds 0.01 0.02 0.03 0.05 `
     --device cuda
 
