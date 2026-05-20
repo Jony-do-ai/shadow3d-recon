@@ -13,6 +13,9 @@ data:
   batch_size: 2
   num_workers: 0
 
+test:
+  "data/test_runs"
+
 model:
   image_feat_dim: 256
   light_feat_dim: 128
