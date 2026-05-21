@@ -2,7 +2,7 @@
 python scripts/train.py --config configs/train_pct_apml.yaml
 
 续跑
-python scripts/train.py --config configs/train_pct_apml.yaml --resume outputs/train_runs/cnn-apml-5frame/checkpoints/epoch_0030.pt
+python scripts/train.py --config configs/train_pct_apml.yaml --resume outputs/train_runs/cnn-apml/checkpoints/epoch_0150.pt
 
 python scripts/infer.py --config data/train_runs/apml-shadow-2part2/config_dump.yaml `
     --checkpoint data/train_runs/apml-shadow-2part2/checkpoints/best.pt --all
