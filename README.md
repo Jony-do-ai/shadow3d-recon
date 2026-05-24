@@ -10,10 +10,10 @@ python scripts/train.py `
 
 推理
 python scripts/infer.py --config configs/train_pct_apml_projection_stage2.yaml `
-    --checkpoint outputs/train_runs/cnn-apml-proj-stage2/checkpoints/best.pt --all
+    --checkpoint outputs/train_runs/cnn-apml/checkpoints/best.pt --all
 
 python scripts/infer.py --config configs/train_pct_apml_projection_stage2.yaml `
-    --checkpoint outputs/train_runs/cnn-apml-proj-stage2/checkpoints/best.pt --all
+    --checkpoint outputs/train_runs/transformer-cnn-apmlcd/checkpoints/best.pt --all
 
 推理指标
 python scripts/eval_existing_pcd_metrics.py `
@@ -22,9 +22,24 @@ python scripts/eval_existing_pcd_metrics.py `
   --device cuda
 
 python scripts/eval_existing_pcd_metrics_csv.py `
-    --root outputs/infer/cnn-apml-proj-stage2 `
+    --root outputs/infer/drwr `
     --thresholds 0.01 0.02 0.03 0.05 `
     --device cuda
+
+drwr的对角线=1的归一化转换并算cd
+python scripts/drwr_cd_renormalize.py --root outputs/infer/drwr
+
+敏感性分析
+mask膨胀或者腐蚀
+radius：自己设置像素值3，5，7，9；膨胀版：--op dilate，腐蚀版：--op erode
+python src\shadow3d\utils\build_fuckpng.py --src data\test_runs\dataset --op erode --radius 30
+
+帧顺序改变
+光线和mask一起打包打乱
+python src\shadow3d\utils\build_chaos_LS.py --src data\test_runs\dataset --seed 42
+只mask打乱
+python src\shadow3d\utils\build_chaos_S.py --src data\test_runs\dataset --seed 42
+
 
 将训练集对应数量的数据移动到测试集
 只列出转移信息用于查看，不做转移操作：

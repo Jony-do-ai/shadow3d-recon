@@ -100,12 +100,31 @@ def build_model_from_config(cfg: Dict[str, Any], device: torch.device) -> Shadow
     return model
 
 
-def build_dataset_from_config(cfg: Dict[str, Any]) -> ShadowSequenceDataset:
+def build_dataset_from_config(cfg: Dict[str, Any], test_seq: str = None) -> ShadowSequenceDataset:
     data_cfg = cfg["data"]
     model_cfg = cfg.get("model", {})
 
-    # 推理时优先使用 test 路径；没有的话再退回训练集 root
-    root = cfg.get("test", data_cfg["root"])
+    # 推理时优先使用 test 配置；没有的话再退回训练集 root。
+    # test 支持两种写法：
+    #   1) 新写法（推荐）: test: {root: "...", sequences_dir: "..."}
+    #   2) 旧写法:        test: "data/test_runs"   （字符串，直接当 root）
+    test_cfg = cfg.get("test", None)
+    if isinstance(test_cfg, dict):
+        root = test_cfg.get("root", data_cfg["root"])
+        seq_dir = test_cfg.get("sequences_dir", data_cfg.get("sequences_dir", "dataset"))
+    elif isinstance(test_cfg, str) and test_cfg.strip():
+        root = test_cfg
+        seq_dir = data_cfg.get("sequences_dir", "dataset")
+    else:
+        root = data_cfg["root"]
+        seq_dir = data_cfg.get("sequences_dir", "dataset")
+
+    # 命令行 --test_seq 优先级最高，用于动态切换子目录（如不同类别/不同划分）
+    if test_seq:
+        seq_dir = test_seq
+
+    print(f"[INFO] Test root = {root}, sequences_dir = {seq_dir} "
+          f"(最终数据目录约为 {os.path.join(root, seq_dir)})")
 
     effective_num_frames = int(data_cfg.get("frames_per_seq", 10))
     max_num_frames = int(model_cfg.get("num_frames", 10))
@@ -123,7 +142,7 @@ def build_dataset_from_config(cfg: Dict[str, Any]) -> ShadowSequenceDataset:
 
     dataset = ShadowSequenceDataset(
         root=root,
-        sequences_dir=data_cfg.get("sequences_dir", "dataset"),
+        sequences_dir=seq_dir,
 
         # 这里是真实读取几帧，不是固定槽位数。
         frames_per_seq=effective_num_frames,
@@ -205,6 +224,8 @@ def main():
     parser.add_argument("--all", action="store_true", help="Infer all samples in dataset")
     parser.add_argument("--base_out_dir", type=str, default="outputs/infer", help="Base directory to save results")
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
+    parser.add_argument("--test_seq", type=str, default=None,
+                        help="动态覆盖测试集子目录(sequences_dir)，如 chair / plane / dataset。不传则用 yaml 里的值")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
@@ -222,7 +243,7 @@ def main():
     final_output_dir = os.path.join(args.base_out_dir, exp_name)
     print(f"[INFO] Output directory set to: {final_output_dir}")
 
-    dataset = build_dataset_from_config(cfg)
+    dataset = build_dataset_from_config(cfg, test_seq=args.test_seq)
     print(f"[INFO] Dataset size: {len(dataset)}")
 
     model = build_model_from_config(cfg, device)

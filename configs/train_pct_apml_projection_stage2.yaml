@@ -23,14 +23,16 @@ data:
   batch_size: 2
   num_workers: 0
 test:
-  "data/test_runs"
+  root: "data/test_runs"
+  # sequences_dir 留空则沿用 data.sequences_dir；可被命令行 --test_seq 覆盖
+  sequences_dir: "dataset"
 model:
   num_frames: 10
   image_feat_dim: 256
   light_feat_dim: 128
   fused_dim: 256
   num_points: 2048
-  use_refiner: false
+  use_refiner: true
   refiner_hidden_dim: 128
   refiner_blocks: 2
   refiner_num_heads: 4
@@ -50,8 +52,8 @@ loss:
   repulsion_radius: 0.03
   repulsion_k: 16
   projection:
-    enabled: true
-    weight: 0.0001
+    enabled: false
+    weight: 0.3
     schedule_by: stage
     start_epoch: 6
     ramp_epochs: 10
@@ -70,13 +72,14 @@ loss:
       num_samples: 1
       save_all_lights: true
 optim:
-  lr: 5.0e-05
+  #lr: 5.0e-05
+  lr: 0.0005
   weight_decay: 0.0
   epochs: 200
   load_optimizer: false
   keep_epoch_number: true
 log:
-  out_dir: outputs/train_runs/cnn-apml-proj-stage2
+  out_dir: outputs/train_runs/cnn-apml-200
   print_every: 10
   save_every_epoch: 10
   append_on_resume: false
