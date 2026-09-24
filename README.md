@@ -27,16 +27,8 @@ The current implementation is a data-driven baseline. It is intentionally simple
 
 ## Method
 
-```mermaid
-flowchart LR
-    A[Shadow mask 1..K] --> B[CNN Shadow Encoder]
-    L[Light direction 1..K] --> C[MLP Light Encoder]
-    B --> D[Per-view Feature Fusion]
-    C --> D
-    D --> E[Mean + Max Aggregation across K views]
-    E --> F[Point Cloud Decoder]
-    F --> G[2048-point 3D reconstruction]
-```
+<img width="2001" height="1009" alt="image" src="https://github.com/user-attachments/assets/814bc6f4-32f5-4a52-90b6-239fbc7619df" />
+
 
 The baseline consists of four main components:
 
