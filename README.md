@@ -48,6 +48,30 @@ Training is driven primarily by **Chamfer Distance** between the predicted and g
 
 ---
 
+## Qualitative Results
+
+The following examples show qualitative reconstruction results from real captured shadow observations.
+
+For each object, multiple shadow images are captured under different illumination directions and used as input to the model. The predicted 3D point cloud is shown alongside the corresponding observations.
+
+### Real-World Shadow Observations
+
+<p align="center">
+   <img width="1056" height="726" alt="image" src="https://github.com/user-attachments/assets/887e0e2d-3dbb-48a2-bda9-e66d6425d712" />
+</p>
+
+<p align="center">
+  <img width="1052" height="724" alt="image" src="https://github.com/user-attachments/assets/119dde14-7d58-490f-8206-ca1c97602fc5" />
+</p>
+
+### 3D Reconstruction Result
+
+<p align="center">
+  <img width="1045" height="395" alt="image" src="https://github.com/user-attachments/assets/a7156640-b180-4a4e-aae8-b0a8217f2864" />
+</p>
+
+These real-world examples provide an initial demonstration that the learned shadow-to-geometry mapping can be applied beyond the synthetic training environment. At the same time, reconstruction quality on unseen real observations remains an important direction for further improvement, particularly in terms of geometric accuracy and generalization.
+
 ## Repository Structure
 
 ```text
